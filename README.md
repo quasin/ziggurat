@@ -1,2 +1,3 @@
-# ziggurat
+# Ziggurat
+
 Ziggurat - some Zig program

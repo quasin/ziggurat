@@ -1,0 +1,5 @@
+!.gitignore
+.zig-cache/
+zig-out/
+.DS_Store
+Thumbs.db

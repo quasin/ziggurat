@@ -1,0 +1,13 @@
+.{
+    .name = .ziggurat,
+    .version = "0.0.0",
+    .fingerprint = 0x5865cceb2b12da1b,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
