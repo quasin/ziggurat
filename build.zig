@@ -12,6 +12,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    exe.linkLibC();
+    exe.linkLibCpp();
+    exe.linkSystemLibrary("rats");
+    exe.addLibraryPath(.{ .cwd_relative = "librats/build/lib" });
+    exe.addIncludePath(b.path("librats/src"));
+
     b.installArtifact(exe);
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
