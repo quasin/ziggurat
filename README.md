@@ -1,6 +1,6 @@
 # Ziggurat
 
-Ziggurat - some Zig program
+Ziggurat - some p2p Zig program
 
 ### ChangeLog
 
