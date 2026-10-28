@@ -11,3 +11,7 @@ arguments, reports its version from `build.zig.zon`, and exits — replace the
     zig build test                  # unit tests
 
 Requires Zig 0.17.0 (`build.zig.zon` `.minimum_zig_version`); no dependencies.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
