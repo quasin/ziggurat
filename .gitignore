@@ -2,6 +2,9 @@
 .zig-cache/
 zig-out/
 
+# librats, built from source by scripts/fetch-librats.sh — generated, not tracked.
+vendor/
+
 # Local tool state.
 *.log
 *.pid
