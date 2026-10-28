@@ -1,8 +1,6 @@
-# ziggurat
+# Ziggurat
 
-A Zig 0.17.0 executable. The scaffold is a working CLI: it parses its own
-arguments, reports its version from `build.zig.zon`, and exits — replace the
-`run` branch in `src/main.zig` with the real work.
+Ziggurat - simple pet project.
 
 ## Build and run
 
