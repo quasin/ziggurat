@@ -1,0 +1,7 @@
+# Zig build output and caches — never committed.
+.zig-cache/
+zig-out/
+
+# Local tool state.
+*.log
+*.pid
