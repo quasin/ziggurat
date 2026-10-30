@@ -8,3 +8,8 @@ vendor/
 # Local tool state.
 *.log
 *.pid
+
+# Where the interface keeps its state when run from the repository: mounted
+# releases, downloaded pieces and the history.
+mnt/
+.ziggurat/
