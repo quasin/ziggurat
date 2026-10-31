@@ -52,9 +52,9 @@ pub fn resolveExecutable(
 
 /// A release's own directory names, so one release's log and pid file can
 /// never be overwritten by another's.
-pub fn dirsOf(allocator: std.mem.Allocator, config: Config, link: []const u8) !struct { mount: []u8, cache: []u8 } {
+pub fn dirsOf(allocator: std.mem.Allocator, config: Config, source: []const u8) !struct { mount: []u8, cache: []u8 } {
     var name_buf: [16]u8 = undefined;
-    const name = magnet.mountName(link, &name_buf);
+    const name = magnet.mountName(source, &name_buf);
     return .{
         .mount = try std.fs.path.join(allocator, &.{ config.mount_root, name }),
         .cache = try std.fs.path.join(allocator, &.{ config.cache, name }),
@@ -67,13 +67,17 @@ pub fn dirsOf(allocator: std.mem.Allocator, config: Config, link: []const u8) !s
 pub fn mount(
     io: Io,
     exe: []const u8,
-    link: []const u8,
+    source: []const u8,
     mount_dir: []const u8,
     cache_dir: []const u8,
 ) !void {
+    // The metadata comes from the swarm (--magnet) or from the file the user
+    // picked (--torrent); everything else about the daemon is the same.
+    const flag: []const u8 = if (magnet.isTorrent(source)) "--torrent" else "--magnet";
+    const value: []const u8 = if (magnet.isTorrent(source)) magnet.torrentPath(source) else source;
     var child = try std.process.spawn(io, .{
         .argv = &.{
-            exe,       "--magnet", link,
+            exe,       flag,       value,
             "-m",      mount_dir,  "--cache",
             cache_dir, "--daemon",
         },

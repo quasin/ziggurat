@@ -25,8 +25,8 @@ pub const Options = struct {
 pub const usage =
     \\usage: ziggurat [options]
     \\
-    \\  Two panels: a magnet line on the left, the history of what you typed on
-    \\  the right. Enter mounts a release through rekarma; Enter on a mounted
+    \\  Two panels: a source line on the left (a magnet link or a .torrent file),
+    \\  the history of what you typed on the right. Enter mounts a release through rekarma; Enter on a mounted
     \\  release lists its media files; Enter on a file plays it with vlc, and the
     \\  player's reads are what pull the pieces out of the swarm.
     \\
@@ -40,12 +40,14 @@ pub const usage =
     \\  --cache <dir>       where pieces and logs are kept    [.ziggurat/cache]
     \\  --history <path>    history file                      [.ziggurat/history.tsv]
     \\
-    \\The magnet line accepts a full link, an xt= or urn: fragment, or a bare
-    \\info-hash (40 hex or 32 base32). Quote the link in the shell: ? and & are
-    \\special there. A link mounts at <mount-root>/<first 8 of the info-hash>.
+    \\The magnet line accepts a full link, an xt= or urn: fragment, a bare
+    \\info-hash (40 hex or 32 base32), or the path of a .torrent file (also as
+    \\file:<path>, for a torrent saved without the extension). Quote the link in
+    \\the shell: ? and & are special there. A link mounts at <mount-root>/<first
+    \\8 of the info-hash>; a .torrent mounts at <mount-root>/<digest of its path>.
     \\
     \\Keys:
-    \\  Enter     mount the magnet line / open the selected row / play a file
+    \\  Enter     mount the source line / open the selected row / play a file
     \\  Tab       move between the input line and the history
     \\  u, x      unmount / remove the selected row
     \\  Esc       clear the input line (or leave the file list)

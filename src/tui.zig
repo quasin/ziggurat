@@ -1,5 +1,5 @@
-//! The two panels: a magnet line on the left, the history of what was typed on
-//! the right. Every row action (mount, unmount, play through vlc) is a key on
+//! The two panels: a source line on the left (a magnet link or a .torrent file),
+//! the history of what was typed on the right. Every row action (mount, unmount, play through vlc) is a key on
 //! the selected row, so the screen never needs a menu.
 const std = @import("std");
 const Io = std.Io;
@@ -285,8 +285,8 @@ pub const App = struct {
             self.setStatus("rekarma не найден в PATH — укажите --rekarma <путь>", .err);
             return;
         };
-        const link = (try magnet.normalize(self.allocator, self.input.items)) orelse {
-            self.setStatus("это не magnet-ссылка: нужен magnet:?xt=… или info-hash", .err);
+        const link = (try magnet.parse(self.allocator, self.io, self.input.items)) orelse {
+            self.setStatus("это не magnet-ссылка и не .torrent: нужен magnet:?xt=…, info-hash или путь к файлу", .err);
             return;
         };
         defer self.allocator.free(link);
@@ -619,7 +619,7 @@ pub const App = struct {
     fn drawTitle(self: *App, frame: *term.Frame, size: term.Size) void {
         frame.at(1, 1);
         frame.put(.title, " ziggurat ");
-        frame.put(.plain, "p2p-релизы: magnet → монтирование → vlc");
+        frame.put(.plain, "p2p-релизы: magnet/.torrent → монтирование → vlc");
         frame.endRow();
 
         var buf: [128]u8 = undefined;
@@ -627,7 +627,7 @@ pub const App = struct {
             self.options.librats_version, self.options.version,
         }) catch return;
         const width = term.displayWidth(right);
-        const used = 10 + term.displayWidth("p2p-релизы: magnet → монтирование → vlc");
+        const used = 10 + term.displayWidth("p2p-релизы: magnet/.torrent → монтирование → vlc");
         if (size.cols > used + width) {
             frame.at(1, size.cols - width + 1);
             frame.put(.dim, right);
@@ -673,7 +673,7 @@ pub const App = struct {
         const offset = if (cursor_cols >= text_width) cursor_cols - text_width + 1 else 0;
         frame.put(.plain, skipCols(self.input.items, offset));
         if (self.input.items.len == 0 and focused) {
-            frame.put(.dim, "magnet:?xt=urn:btih:…  (или info-hash)");
+            frame.put(.dim, "magnet:?xt=… · info-hash · путь к .torrent");
         }
         frame.endRow();
 
@@ -724,7 +724,7 @@ pub const App = struct {
 
         if (entries.len == 0) {
             frame.at(top + 1, left + 2);
-            frame.put(.dim, "пока пусто: вставьте magnet-ссылку слева");
+            frame.put(.dim, "пока пусто: вставьте magnet-ссылку или путь к .torrent слева");
             return;
         }
 

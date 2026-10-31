@@ -2,7 +2,8 @@
 
 A single-executable Zig 0.17.0 project linked against **librats 3.0.4** (C++ p2p
 library), vendored as a static archive **per target triple**. The program is a
-two-panel TUI: a magnet line on the left, the history of what was typed on the
+two-panel TUI: a source line on the left (magnet link, bare info-hash or a
+`.torrent` file), the history of what was typed on the
 right; a row mounts a release as a read-only directory (a FUSE 3 mount served by
 a `rekarma` daemon) and hands one of its files to `vlc`, whose reads pull the
 pieces on demand. `--help` prints the librats version read from the linked
@@ -11,7 +12,7 @@ library at runtime. Published targets: x86_64, aarch64, riscv64 (all linux-gnu).
 Ziggurat itself does not download anything: librats is linked for the version
 report (and is what rekarma mounts through). The torrent, the mount and the
 piece scheduling live behind `--rekarma <binary>`, started once per release as
-`rekarma --magnet <link> -m <dir> --cache <dir> --daemon`.
+`rekarma --magnet <link>|--torrent <file> -m <dir> --cache <dir> --daemon`.
 
 ## Setup, build, test
 
@@ -39,7 +40,7 @@ with libfuse3) and `vlc` on `PATH`, or `--rekarma` / `--vlc` pointing at them.
     src/term.zig                 raw mode, key decoding, frame buffer (clipped, styled text)
     src/procs.zig                spawning rekarma and the player, mount probing, file scan, log tail
     src/history.zig              the history rows and their tab-separated file
-    src/magnet.zig               magnet normalization, info-hash, media filter
+    src/magnet.zig               source normalization (magnet/.torrent), ids, media filter
     src/c.h                      the only C include (`librats/bindings/rats.h`), translated to `c`
     scripts/fetch-librats.sh     3.0.4 pin, targets list, cmake flags, install into vendor/
     vendor/librats/<triple>/     GENERATED, gitignored, replaced wholesale on each fetch
