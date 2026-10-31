@@ -19,9 +19,9 @@
 # tarball builds and makes the linked library report the real version.
 set -euo pipefail
 
-LIBRATS_VERSION="3.0.3"
+LIBRATS_VERSION="3.0.4"
 URL="https://github.com/librats/librats/archive/refs/tags/${LIBRATS_VERSION}.tar.gz"
-SHA256="99ad89281a4fe85bc9fcf70b1d0842aa69d55361cf7c509e1acd3b0a0f8b5ba6"
+SHA256="36e21f34cebef6fb0845f6498f1d91f9c62b944f9a594fe1899b702337f89a1a"
 
 # The triples build.zig looks for; keep in sync with README/AGENTS.md.
 DEFAULT_TARGETS=(x86_64-linux-gnu aarch64-linux-gnu riscv64-linux-gnu)

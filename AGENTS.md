@@ -1,6 +1,6 @@
 # ziggurat — agent notes
 
-A single-executable Zig 0.17.0 project linked against **librats 3.0.3** (C++ p2p
+A single-executable Zig 0.17.0 project linked against **librats 3.0.4** (C++ p2p
 library), vendored as a static archive **per target triple**. The program is a
 two-panel TUI: a magnet line on the left, the history of what was typed on the
 right; a row mounts a release as a read-only directory (a FUSE 3 mount served by
@@ -41,7 +41,7 @@ with libfuse3) and `vlc` on `PATH`, or `--rekarma` / `--vlc` pointing at them.
     src/history.zig              the history rows and their tab-separated file
     src/magnet.zig               magnet normalization, info-hash, media filter
     src/c.h                      the only C include (`librats/bindings/rats.h`), translated to `c`
-    scripts/fetch-librats.sh     3.0.3 pin, targets list, cmake flags, install into vendor/
+    scripts/fetch-librats.sh     3.0.4 pin, targets list, cmake flags, install into vendor/
     vendor/librats/<triple>/     GENERATED, gitignored, replaced wholesale on each fetch
 
 ## Conventions
@@ -84,7 +84,7 @@ with libfuse3) and `vlc` on `PATH`, or `--rekarma` / `--vlc` pointing at them.
 - **librats from a source tarball reports `1.0.0.0` without
   `-DRATS_VERSION_OVERRIDE`** — its CMake falls back to that constant when
   `git describe` is unavailable. The fetch script passes the override, which is
-  why the linked library prints `3.0.3.0`; drop it and the `librats: the library
+  why the linked library prints `3.0.4.0`; drop it and the `librats: the library
   reports the version it was built from` test fails.
 - **librats.a is compiled with `zig c++` against Zig's bundled libc++**, so the
   link calls `link_libcpp = true`. Do not rebuild it with a system GCC/g++: the
