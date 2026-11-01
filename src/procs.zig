@@ -140,6 +140,40 @@ pub fn reap(pid: std.posix.pid_t) void {
     _ = linux.waitpid(pid, &status, linux.W.NOHANG);
 }
 
+/// Reaps a child only once it has exited; false means it is still running and
+/// must be asked again later. Unlike `reap`, this lets a long-lived child keep
+/// its pid instead of turning into a zombie the first time it is polled.
+pub fn reapIfDone(pid: std.posix.pid_t) bool {
+    var status: i32 = 0;
+    return linux.waitpid(pid, &status, linux.W.NOHANG) == pid;
+}
+
+/// The ant-client install pipeline. It needs a shell (`curl | bash`), and a
+/// child writing to this terminal would paint over the panels, so the whole
+/// pipeline's output is redirected into `log_path` and the interface stays
+/// interactive while the installer runs in the background.
+pub fn installCommand(buf: []u8, dir: []const u8, log_path: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "mkdir -p \"{s}\" && ( curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash ) >> \"{s}\" 2>&1",
+        .{ dir, log_path },
+    );
+}
+
+/// Starts the installer without waiting for it: a slow download must not
+/// freeze the interface. The caller reaps the pid through `reap`.
+pub fn installAutonomi(io: Io, dir: []const u8, log_path: []const u8) !std.posix.pid_t {
+    var cmd_buf: [1024]u8 = undefined;
+    const command = try installCommand(&cmd_buf, dir, log_path);
+    const child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", command },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    return child.id orelse error.NoPid;
+}
+
 pub const MediaFile = struct {
     path: []const u8,
     size: u64,
@@ -252,4 +286,12 @@ test "procs: a program is found on PATH or not at all" {
     try testing.expect((try resolveExecutable(arena.allocator(), std.testing.io, "no-such-program-xyz", "/bin:/usr/bin")) == null);
     try testing.expect((try resolveExecutable(arena.allocator(), std.testing.io, "/bin/sh", null)) != null);
     try testing.expect((try resolveExecutable(arena.allocator(), std.testing.io, "/nope/sh", null)) == null);
+}
+
+test "procs: the installer command carries the upstream script and the log" {
+    var buf: [1024]u8 = undefined;
+    const cmd = try installCommand(&buf, ".ziggurat", ".ziggurat/autonomi-install.log");
+    try testing.expect(std.mem.indexOf(u8, cmd, "https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "| bash") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, ".ziggurat/autonomi-install.log") != null);
 }

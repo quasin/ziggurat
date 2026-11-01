@@ -87,6 +87,9 @@ pub const App = struct {
     input: std.ArrayList(u8),
     cursor: usize = 0,
     focus: Focus = .input,
+    /// Whether the install shortcut under the prompt is selected instead of
+    /// the input line. Enter there runs the ant-client installer, not a mount.
+    link_selected: bool = false,
     view: View = .history,
     selected: usize = 0,
 
@@ -101,6 +104,9 @@ pub const App = struct {
     status_len: usize = 0,
     status_style: term.Style = .dim,
     players: std.ArrayList(std.posix.pid_t),
+    /// The installer runs far longer than a player, so its pid stays here
+    /// until `reapIfDone` sees it exit instead of being dropped after one poll.
+    install_pid: ?std.posix.pid_t = null,
     tick: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, config: procs.Config, options: Options) !App {
@@ -201,6 +207,32 @@ pub const App = struct {
     }
 
     fn handleInput(self: *App, key: term.Key) !void {
+        // The install shortcut owns the keys while it is selected: Enter runs
+        // the installer, Up returns to typing and any text key falls through
+        // so the first character lands in the input line as usual.
+        if (self.link_selected) {
+            switch (key) {
+                .down => return,
+                .up => {
+                    self.link_selected = false;
+                    return;
+                },
+                .esc => {
+                    self.link_selected = false;
+                    self.input.clearRetainingCapacity();
+                    self.cursor = 0;
+                    return;
+                },
+                .enter => return self.installAutonomi(),
+                .tab => {
+                    self.link_selected = false;
+                    if (self.list.items.items.len > 0) self.focus = .history;
+                    return;
+                },
+                else => self.link_selected = false,
+            }
+        }
+
         switch (key) {
             .text => |bytes| {
                 try self.input.insertSlice(self.allocator, self.cursor, bytes);
@@ -219,12 +251,14 @@ pub const App = struct {
             .right => self.cursor = nextCodepoint(self.input.items, self.cursor),
             .home => self.cursor = 0,
             .end => self.cursor = self.input.items.len,
+            .down => self.link_selected = true,
             .ctrl_u => {
                 self.input.clearRetainingCapacity();
                 self.cursor = 0;
             },
             .enter => try self.startFromInput(),
             .tab => {
+                self.link_selected = false;
                 if (self.list.items.items.len > 0) self.focus = .history;
             },
             .esc => {
@@ -327,6 +361,31 @@ pub const App = struct {
             return;
         };
         self.setStatus("монтирование запущено", .dim);
+    }
+
+    /// Enter on the install shortcut. The ant-client installer is a curl|bash
+    /// pipeline, so it runs in the background with its output in a log: a child
+    /// writing to this terminal would paint over the panels. The pid goes into
+    /// the same reap list as a player, so it never stays a zombie.
+    fn installAutonomi(self: *App) !void {
+        const dir = std.fs.path.dirname(self.config.cache) orelse ".";
+        var log_buf: [512]u8 = undefined;
+        const log_path = std.fmt.bufPrint(&log_buf, "{s}/autonomi-install.log", .{dir}) catch {
+            self.setStatus("не удалось собрать путь к логу установщика", .err);
+            return;
+        };
+        const pid = procs.installAutonomi(self.io, dir, log_path) catch |err| {
+            var buf: [200]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "установщик ant-client: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+        self.install_pid = pid;
+
+        var buf: [240]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "установщик ant-client запущен · лог: {s}", .{log_path}) catch "установщик ant-client запущен";
+        self.setStatus(text, .ok);
+        self.link_selected = false;
     }
 
     /// Enter on a history row: show its files if it is mounted, mount it if it
@@ -473,6 +532,15 @@ pub const App = struct {
 
         for (self.players.items) |pid| procs.reap(pid);
         self.players.clearRetainingCapacity();
+
+        // The installer is long-running, so keep its pid until it actually
+        // exits: dropping it on the first poll would leave a zombie behind.
+        if (self.install_pid) |pid| {
+            if (procs.reapIfDone(pid)) {
+                self.install_pid = null;
+                self.setStatus("установщик ant-client завершён", .ok);
+            }
+        }
     }
 
     /// Names a release the moment it mounts: the biggest media file inside is
@@ -677,6 +745,18 @@ pub const App = struct {
         }
         frame.endRow();
 
+        // The install shortcut sits under the prompt, so a fresh machine is one
+        // key away from the client. Down selects it, Enter runs the installer
+        // instead of mounting the line.
+        const link_focused = focused and self.link_selected;
+        if (top + 2 < top + height - 1) {
+            frame.at(top + 2, left + 1);
+            frame.put(if (link_focused) .selected else .dim, if (link_focused) "▸ " else "  ");
+            frame.put(if (link_focused) .selected else .accent, "Autonomi Install");
+            frame.put(if (link_focused) .selected else .dim, "  curl | bash");
+            frame.endRow();
+        }
+
         // Under the input: what the selected row is doing right now. A mount
         // waiting for the swarm must not look like a hung program.
         var row = top + 3;
@@ -707,12 +787,12 @@ pub const App = struct {
 
         if (row + 2 < top + height - 1) {
             frame.at(row + 1, left + 1);
-            frame.put(.dim, "Enter — смонтировать");
+            frame.put(.dim, "Enter — смонтировать · ↓ — установщик");
             frame.at(row + 2, left + 1);
             frame.put(.dim, "Tab — к истории, Esc — очистить");
         }
 
-        if (!focused) return null;
+        if (!focused or self.link_selected) return null;
         const cursor_col = left + 3 + (cursor_cols - offset);
         return .{ top + 1, @min(cursor_col, left + width - 2) };
     }
@@ -807,7 +887,7 @@ pub const App = struct {
         frame.at(size.rows - 1, 1);
         const hints = switch (self.view) {
             .history => switch (self.focus) {
-                .input => "Ctrl-C — выход · Tab — история · Enter — смонтировать",
+                .input => "Ctrl-C — выход · Tab — история · Enter — смонтировать · ↓ — установщик",
                 .history => "↑↓ — выбор · Enter — открыть · u — отмонтировать · x — удалить · q — выход",
             },
             .files => "↑↓ — файл · Enter — vlc · Esc — назад · Ctrl-C — выход",
