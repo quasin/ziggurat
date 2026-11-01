@@ -34,9 +34,11 @@ pub const usage =
     \\usage: ziggurat [options]
     \\
     \\  Two panels: a source line on the left (a magnet link or a .torrent file),
-    \\  the history of what you typed on the right. Enter mounts a release through rekarma; Enter on a mounted
-    \\  release lists its media files; Enter on a file plays it with vlc, and the
-    \\  player's reads are what pull the pieces out of the swarm.
+    \\  the history of what you typed on the right. Enter mounts a release through rekarma; once it is
+    \\  mounted the right panel lists every folder and file inside it. Enter on a
+    \\  media file plays it with vlc, Enter on anything else (a book, an archive,
+    \\  a folder) opens it with the desktop opener, and the program's reads are
+    \\  what pull the pieces out of the swarm.
     \\
     \\  `↓` selects the shortcuts under the source line: the ant-client installer,
     \\  the RuTracker.Org database download and its viewer, and the reKarma room.
@@ -48,7 +50,8 @@ pub const usage =
     \\
     \\Options:
     \\  --rekarma <path>    binary that mounts a release      [rekarma]
-    \\  --vlc <path>        binary that plays a file          [vlc]
+    \\  --vlc <path>        binary that plays a media file    [vlc]
+    \\  --open <path>       opener for every other file       [xdg-open]
     \\  --mount-root <dir>  where releases are mounted        [mnt]
     \\  --cache <dir>       where pieces and logs are kept    [.ziggurat/cache]
     \\  --history <path>    history file                      [.ziggurat/history.tsv]
@@ -60,7 +63,7 @@ pub const usage =
     \\8 of the info-hash>; a .torrent mounts at <mount-root>/<digest of its path>.
     \\
     \\Keys:
-    \\  Enter     mount the source line / open the selected row / play a file
+    \\  Enter     mount the source line / open the selected row / open a file
     \\  Tab       move between the input line and the history
     \\  u, x      unmount / remove the selected row
     \\  Esc       clear the input line (or leave the file list)
@@ -68,12 +71,13 @@ pub const usage =
     \\
 ;
 
-const Field = enum { rekarma, player, mount_root, cache, history };
+const Field = enum { rekarma, player, opener, mount_root, cache, history };
 const Flag = struct { name: []const u8, field: Field };
 
 const flags = [_]Flag{
     .{ .name = "--rekarma", .field = .rekarma },
     .{ .name = "--vlc", .field = .player },
+    .{ .name = "--open", .field = .opener },
     .{ .name = "--mount-root", .field = .mount_root },
     .{ .name = "--cache", .field = .cache },
     .{ .name = "--history", .field = .history },
@@ -100,6 +104,7 @@ pub fn parse(args: []const []const u8) Command {
                     switch (flag.field) {
                         .rekarma => options.config.rekarma = value,
                         .player => options.config.player = value,
+                        .opener => options.config.opener = value,
                         .mount_root => options.config.mount_root = value,
                         .cache => options.config.cache = value,
                         .history => options.history_path = value,
@@ -231,6 +236,7 @@ fn run(init: std.process.Init) !void {
             // spawn failure after the user has already pasted a magnet.
             const rekarma_exe = try procs.resolveExecutable(arena, init.io, options.config.rekarma, path_var);
             const player_exe = try procs.resolveExecutable(arena, init.io, options.config.player, path_var);
+            const opener_exe = try procs.resolveExecutable(arena, init.io, options.config.opener, path_var);
             const ant_exe = try procs.resolveExecutable(arena, init.io, "ant", path_var);
             const xz_exe = try procs.resolveExecutable(arena, init.io, "xz", path_var);
 
@@ -248,6 +254,7 @@ fn run(init: std.process.Init) !void {
                 .history_path = options.history_path,
                 .rekarma_exe = rekarma_exe,
                 .player_exe = player_exe,
+                .opener_exe = opener_exe,
                 .ant_exe = ant_exe,
                 .xz_exe = xz_exe,
             });
@@ -283,9 +290,10 @@ test "parse: options take a separate value or an =value" {
     try std.testing.expectEqualStrings("/usr/bin/rekarma", a.run.config.rekarma);
     try std.testing.expectEqualStrings("/tmp/cache", a.run.config.cache);
 
-    const b = parse(&.{ "ziggurat", "--history", "h.tsv", "--mount-root", "rel" });
+    const b = parse(&.{ "ziggurat", "--history", "h.tsv", "--mount-root", "rel", "--open", "/usr/bin/xdg-open" });
     try std.testing.expectEqualStrings("h.tsv", b.run.history_path);
     try std.testing.expectEqualStrings("rel", b.run.config.mount_root);
+    try std.testing.expectEqualStrings("/usr/bin/xdg-open", b.run.config.opener);
 }
 
 test "parse: what does not parse names the argument" {

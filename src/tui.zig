@@ -106,11 +106,15 @@ pub const Options = struct {
     /// ziggurat links no librats of its own to ask.
     rekarma_version: []const u8,
     history_path: []const u8,
-    /// Where `--rekarma` / `--vlc` resolved to, or null when the program is not
-    /// on PATH. Resolved once at startup so a missing program is a message, not
-    /// a failed spawn three keystrokes later.
+    /// Where `--rekarma` / `--vlc` / `--open` resolved to, or null when the
+    /// program is not on PATH. Resolved once at startup so a missing program is
+    /// a message, not a failed spawn three keystrokes later.
     rekarma_exe: ?[]const u8,
     player_exe: ?[]const u8,
+    /// The desktop opener behind a non-media file: a book or an archive has no
+    /// business in a media player, and the mount is a plain directory to
+    /// whatever the desktop associates with the extension.
+    opener_exe: ?[]const u8 = null,
     /// The two tools behind the RuTracker database link: `ant` fetches the
     /// archive, `xz -d` unpacks it in place.
     ant_exe: ?[]const u8 = null,
@@ -136,10 +140,13 @@ pub const App = struct {
     view: View = .history,
     selected: usize = 0,
 
-    /// Files of the release the `files` view shows; owned by `files_arena` and
-    /// rebuilt on every open, never edited in place.
-    files: std.ArrayList(procs.MediaFile),
+    /// Every directory and file of the release the `files` view shows; owned by
+    /// `files_arena` and rebuilt on every open, never edited in place.
+    files: std.ArrayList(procs.Entry),
     files_arena: std.heap.ArenaAllocator,
+    /// The mount the list was taken from, so a row can be printed relative to
+    /// it and opened by its full path. A copy in `files_arena`.
+    files_root: []const u8 = "",
     files_entry: usize = 0,
     files_scroll: usize = 0,
 
@@ -600,7 +607,7 @@ pub const App = struct {
             },
             .enter => {
                 if (self.files_entry < self.files.items.len) {
-                    try self.playPath(self.files.items[self.files_entry].path);
+                    try self.openEntry(self.files_entry);
                 }
             },
             else => {},
@@ -981,32 +988,31 @@ pub const App = struct {
 
     /// The status a mount that just came up earns: what the release holds. A
     /// book (PDF/EPUB), an archive or a release whose files are all unknown
-    /// extensions mounts correctly and then has nothing to hand to a player, so
-    /// saying "смонтирован" alone reads as a failure — the user sees no window
-    /// open and cannot tell the mount from a broken one. One readdir at the
-    /// mount transition, never per frame.
+    /// extensions mounts correctly and then has nothing to hand to a media
+    /// player, so saying "смонтирован" alone reads as a failure — the user sees
+    /// no window open and cannot tell the mount from a broken one. One readdir
+    /// at the mount transition, never per frame.
     fn reportMountMedia(self: *App, index: usize) void {
         const entry = self.list.items.items[index];
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        var found: std.ArrayList(procs.MediaFile) = .empty;
+        var found: std.ArrayList(procs.Entry) = .empty;
         defer found.deinit(self.allocator);
-        procs.listMedia(self.allocator, scratch.allocator(), self.io, entry.mount, &found) catch {};
+        procs.listEntries(self.allocator, scratch.allocator(), self.io, entry.mount, &found) catch {};
+
+        var files: usize = 0;
+        var dirs: usize = 0;
+        for (found.items) |item| {
+            if (item.dir) dirs += 1 else files += 1;
+        }
 
         var buf: [240]u8 = undefined;
-        if (found.items.len == 0) {
-            const text = std.fmt.bufPrint(&buf, "релиз смонтирован, но медиафайлов в нём нет — смотрите {s}", .{entry.mount}) catch "релиз смонтирован, но медиафайлов в нём нет";
+        if (files == 0 and dirs == 0) {
+            const text = std.fmt.bufPrint(&buf, "релиз смонтирован, но файлов в нём нет — каталог {s}", .{entry.mount}) catch "релиз смонтирован, но файлов в нём нет";
             self.setStatus(text, .warn);
             return;
         }
-        if (found.items.len == 1) {
-            var name_buf: [120]u8 = undefined;
-            const name = std.fmt.bufPrint(&name_buf, "{s}", .{std.fs.path.basename(found.items[0].path)}) catch "";
-            const text = std.fmt.bufPrint(&buf, "релиз смонтирован · Enter — открыть {s}", .{name}) catch "релиз смонтирован · Enter — файлы";
-            self.setStatus(text, .ok);
-            return;
-        }
-        const text = std.fmt.bufPrint(&buf, "релиз смонтирован · медиафайлов: {d} · Enter — открыть", .{found.items.len}) catch "релиз смонтирован · Enter — файлы";
+        const text = std.fmt.bufPrint(&buf, "релиз смонтирован · файлов: {d}, папок: {d} · Enter — открыть", .{ files, dirs }) catch "релиз смонтирован · Enter — открыть";
         self.setStatus(text, .ok);
     }
 
@@ -1016,7 +1022,9 @@ pub const App = struct {
 
         _ = self.files_arena.reset(.retain_capacity);
         self.files.clearRetainingCapacity();
-        procs.listMedia(self.allocator, self.files_arena.allocator(), self.io, entry.mount, &self.files) catch {
+        const arena = self.files_arena.allocator();
+        self.files_root = arena.dupe(u8, entry.mount) catch "";
+        procs.listEntries(self.allocator, arena, self.io, entry.mount, &self.files) catch {
             self.setStatus("не удалось прочитать каталог релиза", .err);
             return;
         };
@@ -1024,37 +1032,53 @@ pub const App = struct {
         self.files_scroll = 0;
 
         if (self.files.items.len == 0) {
-            self.setStatus("в релизе нет медиафайлов", .warn);
-            return;
-        }
-        // A single playable file is what most releases are: opening a list of
-        // one to press Enter on it again is a step with nothing to choose.
-        if (self.files.items.len == 1) {
-            try self.playPath(self.files.items[0].path);
+            self.view = .files;
+            self.setStatus("каталог релиза пуст — метаданные без файлов", .warn);
             return;
         }
         self.view = .files;
-        self.setStatus("выберите файл и нажмите Enter", .dim);
+
+        var buf: [200]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{d} записей в {s} · Enter — открыть", .{
+            self.files.items.len, entry.mount,
+        }) catch "файлы релиза · Enter — открыть";
+        self.setStatus(text, .dim);
     }
 
-    /// Starts the player on one file inside a mount and remembers its pid, so
-    /// the tick can reap it when it exits.
-    fn playPath(self: *App, path: []const u8) !void {
-        const exe = self.options.player_exe orelse {
-            self.setStatus("vlc не найден в PATH — укажите --vlc <путь>", .err);
+    /// Enter on a row of the files view: media goes to the player named by
+    /// `--vlc`, anything else to the desktop opener — a book, an archive or a
+    /// whole directory has no business in a media player, and the mount is an
+    /// ordinary directory to whatever the desktop has for that extension.
+    /// Either program reads through the mount, so its reads pull the pieces.
+    fn openEntry(self: *App, index: usize) !void {
+        if (index >= self.files.items.len) return;
+        const item = self.files.items[index];
+        const media = !item.dir and magnet.isMedia(item.path);
+
+        const exe = (if (media) self.options.player_exe else self.options.opener_exe) orelse {
+            self.setStatus(
+                if (media)
+                    "vlc не найден в PATH — укажите --vlc <путь>"
+                else
+                    "xdg-open не найден в PATH — укажите --open <путь>",
+                .err,
+            );
             return;
         };
-        const pid = procs.play(self.io, exe, path) catch |err| {
+        const pid = procs.launch(self.io, exe, item.path) catch |err| {
             var buf: [200]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, "vlc: {s}", .{@errorName(err)}) catch "";
+            const text = std.fmt.bufPrint(&buf, "открыть файл: {s}", .{@errorName(err)}) catch "";
             self.setStatus(text, .err);
             return;
         };
         try self.players.append(self.allocator, pid);
 
-        var buf: [160]u8 = undefined;
-        const name = std.fs.path.stem(std.fs.path.basename(path));
-        const text = std.fmt.bufPrint(&buf, "vlc: {s}", .{name}) catch "запущен vlc";
+        var buf: [200]u8 = undefined;
+        const base = std.fs.path.basename(item.path);
+        const text = std.fmt.bufPrint(&buf, "{s}: {s}", .{
+            if (media) "vlc" else "открываю",
+            truncateTo(base, 120),
+        }) catch "открываю файл";
         self.setStatus(text, .ok);
     }
 
@@ -1098,6 +1122,13 @@ pub const App = struct {
                 rt.note_len = 0;
                 self.nameEntry(i);
                 self.reportMountMedia(i);
+                // The row the user is looking at opens its own listing: what a
+                // mount holds is the answer to the keypress that started it, and
+                // waiting for a second Enter to see any names is what made a
+                // mounted release look like a failed one.
+                if (self.view == .history and self.focus == .history and self.selected == i) {
+                    self.openFiles(i) catch {};
+                }
                 continue;
             }
             if (self.tick - rt.started_tick > mount_timeout_ticks) {
@@ -1165,21 +1196,24 @@ pub const App = struct {
         }
     }
 
-    /// Names a release the moment it mounts: the biggest media file inside is
-    /// the only name a magnet link does not carry.
+    /// Names a release the moment it mounts: the biggest file inside is the
+    /// only name a magnet link does not carry. Directories are skipped — their
+    /// size is not known without walking them, and a folder name is a worse
+    /// label than the file it holds.
     fn nameEntry(self: *App, index: usize) void {
         const entry = &self.list.items.items[index];
         if (entry.title.len > 0) return;
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        var found: std.ArrayList(procs.MediaFile) = .empty;
+        var found: std.ArrayList(procs.Entry) = .empty;
         defer found.deinit(self.allocator);
-        procs.listMedia(self.allocator, arena.allocator(), self.io, entry.mount, &found) catch return;
+        procs.listEntries(self.allocator, arena.allocator(), self.io, entry.mount, &found) catch return;
 
-        var best: ?procs.MediaFile = null;
-        for (found.items) |file| {
-            if (best == null or file.size > best.?.size) best = file;
+        var best: ?procs.Entry = null;
+        for (found.items) |item| {
+            if (item.dir) continue;
+            if (best == null or item.size > best.?.size) best = item;
         }
         const chosen = best orelse return;
         const name = std.fs.path.stem(std.fs.path.basename(chosen.path));
@@ -1301,7 +1335,7 @@ pub const App = struct {
         drawBox(&frame, top, 1, height, left_width, "Ввод");
         drawBox(&frame, top, right_left, height, right_width, switch (self.view) {
             .history => "История",
-            .files => "Файлы релиза",
+            .files => "Содержимое релиза",
             .room => "Комната reKarma",
             .database => "База RuTracker.Org",
         });
@@ -1647,9 +1681,15 @@ pub const App = struct {
     fn drawFilesPanel(self: *App, frame: *term.Frame, top: u16, left: u16, height: u16, width: u16) void {
         const inner_width = width - 2;
 
+        var files: usize = 0;
+        var dirs: usize = 0;
+        for (self.files.items) |item| {
+            if (item.dir) dirs += 1 else files += 1;
+        }
+
         frame.at(top + 1, left + 2);
-        var head: [96]u8 = undefined;
-        const head_text = std.fmt.bufPrint(&head, "{d} файл(ов) · Enter — vlc", .{self.files.items.len}) catch "";
+        var head: [110]u8 = undefined;
+        const head_text = std.fmt.bufPrint(&head, "файлов: {d} · папок: {d} · Enter — открыть", .{ files, dirs }) catch "";
         frame.put(.dim, head_text);
         frame.endRow();
 
@@ -1660,22 +1700,29 @@ pub const App = struct {
         var i: usize = 0;
         while (i < visible_rows and self.files_scroll + i < self.files.items.len) : (i += 1) {
             const index = self.files_scroll + i;
-            const file = self.files.items[index];
+            const item = self.files.items[index];
             const selected = index == self.files_entry;
             const row = top + 2 + @as(u16, @intCast(i));
 
+            // The tree: depth comes from the path below the mount, so a folder
+            // and what is inside it read as one block.
+            const rel = relUnder(item.path, self.files_root);
+            const depth: u16 = @intCast(@min(depthOf(rel), 8));
+            const indent: u16 = depth * 2;
+
             var size_buf: [24]u8 = undefined;
-            const size = sizeText(&size_buf, file.size);
+            const tail = if (item.dir) "папка" else sizeText(&size_buf, item.size);
 
             frame.at(row, left + 1);
             frame.put(if (selected) .selected else .dim, if (selected) "▸" else " ");
             frame.put(if (selected) .selected else .plain, " ");
-            const room_i: i32 = @as(i32, inner_width) - @as(i32, term.displayWidth(size)) - 6;
+            frame.spaces(indent);
+            const room_i: i32 = @as(i32, inner_width) - @as(i32, term.displayWidth(tail)) - 6 - @as(i32, indent);
             const room: u16 = @intCast(@max(room_i, 4));
-            const name = std.fs.path.stem(std.fs.path.basename(file.path));
-            frame.put(if (selected) .selected else .plain, truncateTo(name, room));
+            frame.put(if (selected) .selected else @as(term.Style, if (item.dir) .accent else .plain), truncateTo(std.fs.path.basename(rel), room));
+            if (item.dir) frame.put(if (selected) .selected else .accent, "/");
             frame.put(if (selected) .selected else .dim, "  ");
-            frame.put(if (selected) .selected else .dim, size);
+            frame.put(if (selected) .selected else .dim, tail);
             frame.endRow();
         }
     }
@@ -1691,7 +1738,7 @@ pub const App = struct {
                 .input => "Ctrl-C — выход · Tab — история · Enter — смонтировать · ↓ — ссылки",
                 .history => "↑↓ — выбор · Enter — открыть · u — отмонтировать · x — удалить · q — выход",
             },
-            .files => "↑↓ — файл · Enter — vlc · Esc — назад · Ctrl-C — выход",
+            .files => "↑↓ — выбор · Enter — открыть · Esc — назад · Ctrl-C — выход",
             .room => "Enter — отправить · ↑↓ — прокрутка · Home/End · Esc — назад · Ctrl-C — выход",
             .database => "Enter — поиск · ↓ — результаты · Enter — смонтировать · Esc — назад",
         };
@@ -1772,6 +1819,19 @@ fn truncateTo(text: []const u8, cols: u16) []const u8 {
     return term.clip(text, cols);
 }
 
+/// The part of `path` below `root`: the mount prefix is the same on every row
+/// of the files view and only eats the width a name needs.
+fn relUnder(path: []const u8, root: []const u8) []const u8 {
+    if (root.len == 0 or path.len <= root.len) return path;
+    if (std.mem.startsWith(u8, path, root) and path[root.len] == '/') return path[root.len + 1 ..];
+    return path;
+}
+
+/// How deep a path sits below the mount root, for the tree indent.
+fn depthOf(rel: []const u8) usize {
+    return std.mem.count(u8, rel, "/");
+}
+
 fn skipCols(text: []const u8, cols: u16) []const u8 {
     if (cols == 0) return text;
     var seen: u16 = 0;
@@ -1812,6 +1872,15 @@ test "tui: cursor movement stops on codepoint boundaries" {
 test "tui: skipping columns keeps the utf-8 text valid" {
     try testing.expectEqualStrings("вет", skipCols("привет", 3));
     try testing.expectEqualStrings("привет", skipCols("привет", 0));
+}
+
+test "tui: a release row is printed below its mount and indented by its depth" {
+    try testing.expectEqualStrings("CD1/01.flac", relUnder("mnt/97bcd8ad/CD1/01.flac", "mnt/97bcd8ad"));
+    try testing.expectEqualStrings("book.pdf", relUnder("mnt/97bcd8ad/book.pdf", "mnt/97bcd8ad"));
+    // A path that does not start with the root is left alone rather than cut.
+    try testing.expectEqualStrings("other/x", relUnder("other/x", "mnt/97bcd8ad"));
+    try testing.expectEqual(@as(usize, 0), depthOf("book.pdf"));
+    try testing.expectEqual(@as(usize, 2), depthOf("CD1/Art/cover.jpg"));
 }
 
 test "tui: sizes are reported in the largest unit that fits" {

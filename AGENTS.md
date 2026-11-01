@@ -4,8 +4,9 @@ A single-executable Zig 0.17.0 project with no C dependencies. The program is a
 two-panel TUI: a source line on the left (magnet link, bare info-hash or a
 `.torrent` file), the history of what was typed on the
 right; a row mounts a release as a read-only directory (a FUSE 3 mount served by
-a `rekarma` daemon) and hands one of its files to `vlc`, whose reads pull the
-pieces on demand. Published targets: x86_64, aarch64, riscv64 (all linux-gnu).
+a `rekarma` daemon) and lists every folder and file inside it. Enter hands a
+media file to `vlc` and anything else to `--open` (xdg-open), and the reader's
+reads are what pull the pieces on demand. Published targets: x86_64, aarch64, riscv64 (all linux-gnu).
 
 Ziggurat itself does not download anything and does not link librats. The
 torrent, the mount and the piece scheduling live behind `--rekarma <binary>`,
@@ -54,7 +55,8 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
   Long-lived state (the history, the file list) uses `init.gpa`, never the arena:
   the process outlives the screen by a long time.
 - External programs are resolved once in `main` (`procs.resolveExecutable`, PATH
-  from `init.environ_map`) and passed to the app as `rekarma_exe` / `player_exe`.
+  from `init.environ_map`) and passed to the app as `rekarma_exe` /
+  `player_exe` / `opener_exe`.
   A missing program is a warning on the status line and a refused action with the
   fix in it, never a bare `FileNotFound` from a spawn the user cannot see.
 - Parsing lives in `parse()`, which returns a `Command`; `main` only dispatches.
@@ -158,13 +160,15 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
   the row counts as mounted only when a readdir of `<mount-root>/<hash>` returns
   an entry, polled once a tick. Probing root-level readdir is metadata-only and
   does not touch the swarm.
-- **A mount is not necessarily a playable release.** The dump holds books and
-  archives as often as video: a PDF mounts exactly like a film and then has
-  nothing to hand to `vlc`, which from the panel looks like a mount that never
-  happened. `reportMountMedia` runs one readdir at the mounted transition (once
-  per release, not per frame) and either names the single file to press Enter
-  for or says there is no media and where to browse — the status must never be
-  a bare "смонтирован".
+- **A mount is not necessarily a playable release, so the files view lists
+  everything.** The dump holds books and archives as often as video: `files`
+  now holds every directory and file of the mount (`procs.listEntries`, capped
+  at 2000 rows), printed as a tree indented by path depth, and Enter sends
+  media to `--vlc` but everything else — a PDF, an archive, a folder — to
+  `--open` (xdg-open). Filtering the list to media is what made a mounted book
+  look like a failed mount. The listing opens by itself when the row that
+  finished mounting is the selected one, and `reportMountMedia` still states
+  "файлов: N, папок: M" so the status is never a bare "смонтирован".
 - **A daemon per release needs its own cache dir**, `<cache>/<hash>`: rekarma
   writes `magnet.pid`/`magnet.log` into `--cache`, so two releases sharing one
   directory would overwrite each other's pid and stop the wrong mount.

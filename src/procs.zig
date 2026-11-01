@@ -11,6 +11,9 @@ pub const Config = struct {
     rekarma: []const u8 = "rekarma",
     /// The binary that plays one; vlc, by default.
     player: []const u8 = "vlc",
+    /// The desktop opener behind every non-media file of a release: a book, an
+    /// archive or a folder goes here instead of to the player.
+    opener: []const u8 = "xdg-open",
     /// Where releases are mounted: <mount_root>/<8-char hash>.
     mount_root: []const u8 = "mnt",
     /// Where pieces and the daemon's log/pid are kept:
@@ -231,10 +234,10 @@ pub fn reapCode(pid: std.posix.pid_t) ?u32 {
     return @intCast((status >> 8) & 0xff);
 }
 
-/// Hands a file inside the mount to the player. The path stays inside the
-/// FUSE mount, so the player's reads are what pull the pieces: nothing is
-/// downloaded until the playhead gets there.
-pub fn play(io: Io, exe: []const u8, path: []const u8) !std.posix.pid_t {
+/// Hands a file inside the mount to a program: the player for media, the
+/// desktop opener for everything else. The path stays inside the FUSE mount, so
+/// whatever reads it is what pulls the pieces — nothing is copied out.
+pub fn launch(io: Io, exe: []const u8, path: []const u8) !std.posix.pid_t {
     const child = try std.process.spawn(io, .{
         .argv = &.{ exe, path },
         .stdin = .ignore,
@@ -354,35 +357,48 @@ pub fn toolVersions(
     return parseToolVersions(result.stdout, rekarma_buf, librats_buf);
 }
 
-pub const MediaFile = struct {
+/// One row of a release as the files view lists it: a directory or a file,
+/// with the path inside the mount (root included) so the player or the desktop
+/// opener can be handed it unchanged.
+pub const Entry = struct {
     path: []const u8,
-    size: u64,
+    size: u64 = 0,
+    dir: bool = false,
 };
 
-/// The playable files of a release, sorted so the list is stable between
-/// frames. The walk is bounded: a release with thousands of files must not
-/// turn one keypress into a second of readdir.
+/// Every directory and file of a release, sorted so parents come before their
+/// children and a directory before the files beside it — the panel indents by
+/// depth, which only reads as a tree with that order.
+///
+/// The walk is bounded: a release with thousands of files must not turn one
+/// keypress into a second of readdir.
 ///
 /// Two allocators on purpose: the list's own buffer must outlive a frame (and
 /// be freed by whoever owns the list), while the paths it holds are rebuilt
 /// from scratch on every open and belong to a scratch arena.
-pub fn listMedia(
+pub fn listEntries(
     list_allocator: std.mem.Allocator,
     path_allocator: std.mem.Allocator,
     io: Io,
     root: []const u8,
-    out: *std.ArrayList(MediaFile),
+    out: *std.ArrayList(Entry),
 ) !void {
     try scan(list_allocator, path_allocator, io, root, 0, out);
-    std.mem.sort(MediaFile, out.items, {}, struct {
-        fn lessThan(_: void, a: MediaFile, b: MediaFile) bool {
+    std.mem.sort(Entry, out.items, {}, struct {
+        fn lessThan(_: void, a: Entry, b: Entry) bool {
+            const pa = std.fs.path.dirname(a.path) orelse "";
+            const pb = std.fs.path.dirname(b.path) orelse "";
+            if (!std.mem.eql(u8, pa, pb)) return std.mem.lessThan(u8, pa, pb);
+            if (a.dir != b.dir) return a.dir;
             return std.mem.lessThan(u8, a.path, b.path);
         }
     }.lessThan);
 }
 
 const max_depth = 8;
-const max_files = 500;
+/// A release can hold hundreds of tracks plus scans; the cap is what keeps one
+/// keypress from walking a pathological tree, not a display limit.
+const max_files = 2000;
 
 fn scan(
     list_allocator: std.mem.Allocator,
@@ -390,7 +406,7 @@ fn scan(
     io: Io,
     path: []const u8,
     depth: usize,
-    out: *std.ArrayList(MediaFile),
+    out: *std.ArrayList(Entry),
 ) !void {
     if (depth > max_depth or out.items.len >= max_files) return;
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
@@ -402,9 +418,13 @@ fn scan(
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         const child = try std.fs.path.join(path_allocator, &.{ path, entry.name });
         switch (entry.kind) {
-            .directory => try scan(list_allocator, path_allocator, io, child, depth + 1, out),
+            // The directory is a row of its own as well as a level to descend
+            // into: the panel names the folders the user sees in the mount.
+            .directory => {
+                try out.append(list_allocator, .{ .path = child, .dir = true });
+                try scan(list_allocator, path_allocator, io, child, depth + 1, out);
+            },
             .file, .sym_link => {
-                if (!magnet.isMedia(entry.name)) continue;
                 const size = fileSize(io, child) orelse 0;
                 try out.append(list_allocator, .{ .path = child, .size = size });
             },
