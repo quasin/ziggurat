@@ -158,6 +158,13 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
   the row counts as mounted only when a readdir of `<mount-root>/<hash>` returns
   an entry, polled once a tick. Probing root-level readdir is metadata-only and
   does not touch the swarm.
+- **A mount is not necessarily a playable release.** The dump holds books and
+  archives as often as video: a PDF mounts exactly like a film and then has
+  nothing to hand to `vlc`, which from the panel looks like a mount that never
+  happened. `reportMountMedia` runs one readdir at the mounted transition (once
+  per release, not per frame) and either names the single file to press Enter
+  for or says there is no media and where to browse — the status must never be
+  a bare "смонтирован".
 - **A daemon per release needs its own cache dir**, `<cache>/<hash>`: rekarma
   writes `magnet.pid`/`magnet.log` into `--cache`, so two releases sharing one
   directory would overwrite each other's pid and stop the wrong mount.

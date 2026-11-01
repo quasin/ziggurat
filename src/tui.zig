@@ -628,9 +628,11 @@ pub const App = struct {
         self.input.clearRetainingCapacity();
         self.cursor = 0;
 
-        // A link already in the history is moved up, not duplicated — and if it
-        // is still mounted, Enter means "show me its files" rather than a
-        // second daemon on the same mountpoint.
+        // A link already in the history is moved up, not duplicated — and Enter
+        // then means exactly what it means on that row: show its files when it
+        // is mounted, retry the mount when it is not. Returning early for an
+        // idle or failed row left the dump view unable to remount a release
+        // that had been unmounted or had once failed.
         if (self.list.findIndex(link)) |existing| {
             self.list.moveToTop(existing);
             const moved = self.runtime.orderedRemove(existing);
@@ -638,7 +640,7 @@ pub const App = struct {
             self.selected = 0;
             self.focus = .history;
             try self.saveHistory();
-            if (self.runtime.items[0].state == .mounted) try self.openFiles(0);
+            try self.activate(0);
             return;
         }
 
@@ -977,6 +979,37 @@ pub const App = struct {
         }
     }
 
+    /// The status a mount that just came up earns: what the release holds. A
+    /// book (PDF/EPUB), an archive or a release whose files are all unknown
+    /// extensions mounts correctly and then has nothing to hand to a player, so
+    /// saying "смонтирован" alone reads as a failure — the user sees no window
+    /// open and cannot tell the mount from a broken one. One readdir at the
+    /// mount transition, never per frame.
+    fn reportMountMedia(self: *App, index: usize) void {
+        const entry = self.list.items.items[index];
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        var found: std.ArrayList(procs.MediaFile) = .empty;
+        defer found.deinit(self.allocator);
+        procs.listMedia(self.allocator, scratch.allocator(), self.io, entry.mount, &found) catch {};
+
+        var buf: [240]u8 = undefined;
+        if (found.items.len == 0) {
+            const text = std.fmt.bufPrint(&buf, "релиз смонтирован, но медиафайлов в нём нет — смотрите {s}", .{entry.mount}) catch "релиз смонтирован, но медиафайлов в нём нет";
+            self.setStatus(text, .warn);
+            return;
+        }
+        if (found.items.len == 1) {
+            var name_buf: [120]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "{s}", .{std.fs.path.basename(found.items[0].path)}) catch "";
+            const text = std.fmt.bufPrint(&buf, "релиз смонтирован · Enter — открыть {s}", .{name}) catch "релиз смонтирован · Enter — файлы";
+            self.setStatus(text, .ok);
+            return;
+        }
+        const text = std.fmt.bufPrint(&buf, "релиз смонтирован · медиафайлов: {d} · Enter — открыть", .{found.items.len}) catch "релиз смонтирован · Enter — файлы";
+        self.setStatus(text, .ok);
+    }
+
     fn openFiles(self: *App, index: usize) !void {
         if (index >= self.list.items.items.len) return;
         const entry = self.list.items.items[index];
@@ -1064,9 +1097,7 @@ pub const App = struct {
                 rt.state = .mounted;
                 rt.note_len = 0;
                 self.nameEntry(i);
-                var buf: [96]u8 = undefined;
-                const text = std.fmt.bufPrint(&buf, "релиз смонтирован · Enter — файлы", .{}) catch "";
-                self.setStatus(text, .ok);
+                self.reportMountMedia(i);
                 continue;
             }
             if (self.tick - rt.started_tick > mount_timeout_ticks) {
