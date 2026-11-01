@@ -65,16 +65,24 @@ const Focus = enum { input, history };
 const View = enum { history, files };
 
 /// The shortcuts under the source line: fixed one-shot jobs, each with its own
-/// log, not history entries. `↓` walks them, Enter runs the selected one.
+/// log, not history entries. `↓` walks them, Enter runs the selected one. The
+/// room shortcut is the one that stays: it opens the default room's history in
+/// the left panel instead of running a job and returning.
 const Link = struct {
     label: []const u8,
     action: Action,
 };
-const Action = enum { autonomi_install, rutracker_database };
+const Action = enum { autonomi_install, rutracker_database, room_history };
 const links = [_]Link{
     .{ .label = "Autonomi Install", .action = .autonomi_install },
     .{ .label = "Install RuTracker.Org DataBase", .action = .rutracker_database },
+    .{ .label = "История reKarma", .action = .room_history },
 };
+
+/// How many of the room's newest messages are kept in memory. The recorder caps
+/// its file at 1000 lines; the panel shows the tail of that, and keeping more
+/// than it can ever print only makes a reload more expensive.
+const room_max_lines: usize = 200;
 
 pub const Options = struct {
     version: []const u8,
@@ -119,6 +127,22 @@ pub const App = struct {
     files_entry: usize = 0,
     files_scroll: usize = 0,
 
+    /// The default room's history: rekarma's `all.txt`, read into memory when the
+    /// file changes and shown under the links while `room_shown`. The lines live
+    /// in the app's allocator because they outlive a frame; the panel only ever
+    /// prints slices of them.
+    room_shown: bool = false,
+    /// Whether this session started the recorder (as opposed to finding one
+    /// already running). Only that one is reported on the way out.
+    room_started: bool = false,
+    room_lines: std.ArrayList([]u8),
+    room_absent: bool = false,
+    /// The file state the lines were read at. An unchanged stat costs one syscall
+    /// per tick and no allocation, which is how the panel stays live.
+    room_read: bool = false,
+    room_size: u64 = 0,
+    room_mtime: i96 = 0,
+
     status_buf: [240]u8 = @splat(0),
     status_len: usize = 0,
     status_style: term.Style = .dim,
@@ -141,6 +165,7 @@ pub const App = struct {
             .input = .empty,
             .files = .empty,
             .files_arena = std.heap.ArenaAllocator.init(allocator),
+            .room_lines = .empty,
             .players = .empty,
         };
         try app.list.load(io, options.history_path);
@@ -172,6 +197,8 @@ pub const App = struct {
         self.input.deinit(self.allocator);
         self.files.deinit(self.allocator);
         self.files_arena.deinit();
+        self.clearRoom();
+        self.room_lines.deinit(self.allocator);
         self.players.deinit(self.allocator);
     }
 
@@ -423,7 +450,98 @@ pub const App = struct {
         switch (links[self.link_index].action) {
             .autonomi_install => try self.installAutonomi(),
             .rutracker_database => try self.downloadRutrackerDatabase(),
+            .room_history => try self.toggleRoomHistory(),
         }
+    }
+
+    /// Enter on the room shortcut: the default room's history appears under the
+    /// links and refreshes with every message, and a recorder is started when
+    /// none is running — without one the file never grows and the panel would
+    /// look broken. The recorder is a daemon of its own: like a mount it outlives
+    /// the interface, so Enter again only hides the panel.
+    fn toggleRoomHistory(self: *App) !void {
+        if (self.room_shown) {
+            self.room_shown = false;
+            self.link_selected = false;
+            self.setStatus("история комнаты reKarma скрыта — запись продолжается", .dim);
+            return;
+        }
+
+        const started = !procs.recorderRunning(self.io);
+        if (started) {
+            const exe = self.options.rekarma_exe orelse {
+                self.setStatus("rekarma не найден в PATH — укажите --rekarma <путь>", .err);
+                return;
+            };
+            procs.startRecorder(self.io, exe) catch |err| {
+                var buf: [200]u8 = undefined;
+                const text = std.fmt.bufPrint(&buf, "запись комнаты reKarma: {s}", .{@errorName(err)}) catch "";
+                self.setStatus(text, .err);
+                return;
+            };
+            self.room_started = true;
+        }
+
+        self.room_shown = true;
+        // The link stays selected so the same key closes what it opened; any
+        // other key falls back to typing by itself.
+        self.link_selected = true;
+        self.room_read = false;
+        self.refreshRoom();
+
+        var buf: [220]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{s} · комната reKarma · {d} сообщ. · {s}", .{
+            if (started) "запись запущена, лог " ++ procs.room_log_file else "запись уже идёт",
+            self.room_lines.items.len,
+            procs.room_file,
+        }) catch "";
+        self.setStatus(text, .ok);
+    }
+
+    /// Reads the room's file when it changed: one stat per tick, one read per
+    /// message. The lines are copies in the app's allocator and are replaced as a
+    /// whole, so the panel can never print half a message.
+    fn refreshRoom(self: *App) void {
+        const st = std.Io.Dir.cwd().statFile(self.io, procs.room_file, .{}) catch {
+            self.room_absent = true;
+            self.room_read = true;
+            self.clearRoom();
+            return;
+        };
+        self.room_absent = false;
+        if (self.room_read and st.size == self.room_size and st.mtime.nanoseconds == self.room_mtime) return;
+
+        self.room_size = st.size;
+        self.room_mtime = st.mtime.nanoseconds;
+        self.room_read = true;
+        self.clearRoom();
+
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const data = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            procs.room_file,
+            scratch.allocator(),
+            .limited(1 << 20),
+        ) catch return;
+
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            const copy = self.allocator.dupe(u8, line) catch return;
+            self.room_lines.append(self.allocator, copy) catch {
+                self.allocator.free(copy);
+                return;
+            };
+            if (self.room_lines.items.len > room_max_lines) {
+                self.allocator.free(self.room_lines.orderedRemove(0));
+            }
+        }
+    }
+
+    fn clearRoom(self: *App) void {
+        for (self.room_lines.items) |line| self.allocator.free(line);
+        self.room_lines.clearRetainingCapacity();
     }
 
     /// Enter on the RuTracker shortcut: `ant file download` fetches the archive
@@ -611,6 +729,10 @@ pub const App = struct {
         for (self.players.items) |pid| procs.reap(pid);
         self.players.clearRetainingCapacity();
 
+        // The room panel is a tail: it has to follow the file while it is open,
+        // and costs one stat when nothing arrived.
+        if (self.room_shown) self.refreshRoom();
+
         // The installer is long-running, so keep its pid until it actually
         // exits: dropping it on the first poll would leave a zombie behind.
         if (self.install_pid) |pid| {
@@ -670,6 +792,14 @@ pub const App = struct {
     /// daemons of their own and outlive the TUI on purpose, so the last thing
     /// printed is how to stop them rather than a silent surprise.
     pub fn printRemaining(self: *App, out: *Io.Writer) !void {
+        // The recorder this session started is a daemon like a mount: it keeps
+        // writing the room after the screen is gone, so say how to stop it.
+        if (self.room_started) {
+            try out.print("ziggurat: комната reKarma пишется в {s} — kill $(cat {s})\n", .{
+                procs.room_file, procs.room_pid_file,
+            });
+        }
+
         var count: usize = 0;
         for (self.runtime.items) |rt| {
             if (rt.state == .mounted) count += 1;
@@ -873,7 +1003,11 @@ pub const App = struct {
             }
         }
 
-        if (row + 2 < top + height - 1) {
+        if (self.room_shown) {
+            // The room's history takes every row the hints would use: it is the
+            // one thing in this panel that grows on its own.
+            self.drawRoom(frame, row, top + height - 1, left, width);
+        } else if (row + 2 < top + height - 1) {
             frame.at(row + 1, left + 1);
             frame.put(.dim, "Enter — выполнить · ↑↓ — ссылки");
             frame.at(row + 2, left + 1);
@@ -883,6 +1017,54 @@ pub const App = struct {
         if (!focused or self.link_selected) return null;
         const cursor_col = left + 3 + (cursor_cols - offset);
         return .{ top + 1, @min(cursor_col, left + width - 2) };
+    }
+
+    /// The default room's last messages, newest at the bottom: the panel is a
+    /// tail, so whatever arrived last is what the eye lands on.
+    fn drawRoom(self: *App, frame: *term.Frame, first: u16, border_bottom: u16, left: u16, width: u16) void {
+        if (border_bottom < first + 2) return;
+        const last = border_bottom - 1;
+        const text_width: u16 = width -| 4;
+
+        var head_buf: [96]u8 = undefined;
+        const head = if (self.room_absent)
+            std.fmt.bufPrint(&head_buf, "комната reKarma · {s} нет", .{procs.room_file}) catch ""
+        else
+            std.fmt.bufPrint(&head_buf, "комната reKarma · {d} сообщ.", .{self.room_lines.items.len}) catch "";
+        frame.at(first, left + 1);
+        frame.put(.accent, truncateTo(head, text_width));
+        frame.endRow();
+
+        if (self.room_lines.items.len == 0) {
+            frame.at(first + 1, left + 1);
+            frame.put(.dim, truncateTo(
+                if (self.room_absent) "лог появится с первым сообщением" else "пока никто ничего не написал",
+                text_width,
+            ));
+            frame.endRow();
+            return;
+        }
+
+        const rows = last - first;
+        const start = self.room_lines.items.len -| rows;
+        var i: usize = 0;
+        while (i < rows) : (i += 1) {
+            const index = start + i;
+            if (index >= self.room_lines.items.len) break;
+            const row = first + 1 + @as(u16, @intCast(i));
+
+            const line = parseRoomLine(self.room_lines.items[index]);
+            frame.at(row, left + 1);
+            frame.put(.dim, " ");
+            var used: u16 = 2;
+            if (line.stamp.len > 0) {
+                frame.put(.dim, line.stamp);
+                frame.put(.dim, " ");
+                used += 6;
+            }
+            frame.put(.plain, truncateTo(line.text, text_width -| used));
+            frame.endRow();
+        }
     }
 
     fn drawHistoryPanel(self: *App, frame: *term.Frame, top: u16, left: u16, height: u16, width: u16) void {
@@ -994,6 +1176,35 @@ fn sizeText(buf: []u8, bytes: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ value, units[unit] }) catch "";
 }
 
+const RoomLine = struct { stamp: []const u8, text: []const u8 };
+
+/// One recorder line, "<ISO stamp> <peer id> <message>", split for the panel: the
+/// date and the peer id are bookkeeping a 26-column panel cannot afford, and the
+/// time of day is the only part of the stamp it can use. A line the recorder did
+/// not write is shown as it is rather than mangled.
+fn parseRoomLine(line: []const u8) RoomLine {
+    if (line.len > 22 and line[4] == '-' and line[10] == 'T' and line[19] == 'Z' and line[20] == ' ') {
+        var rest = line[21..];
+        while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
+        if (std.mem.indexOfScalar(u8, rest, ' ')) |at| {
+            return .{ .stamp = line[11..16], .text = rest[at + 1 ..] };
+        }
+    }
+    return .{ .stamp = "", .text = line };
+}
+
+test "tui: a room line is shown as its time and its message" {
+    const recorded = parseRoomLine("2026-10-16T06:44:42Z ffead4bba412 msg_1");
+    try testing.expectEqualStrings("06:44", recorded.stamp);
+    try testing.expectEqualStrings("msg_1", recorded.text);
+
+    // Anything else stays whole: the recorder is the only writer of that file,
+    // but a hand-edited line must not lose its text to a failed split.
+    const plain = parseRoomLine("не строка записи");
+    try testing.expectEqualStrings("", plain.stamp);
+    try testing.expectEqualStrings("не строка записи", plain.text);
+}
+
 /// Keeps a title inside its column, on a codepoint boundary.
 fn truncateTo(text: []const u8, cols: u16) []const u8 {
     if (term.displayWidth(text) <= cols or cols == 0) return text;
@@ -1030,7 +1241,8 @@ const testing = std.testing;
 
 test "tui: cursor movement stops on codepoint boundaries" {
     const text = "abщв";
-    try testing.expectEqual(@as(usize, 3), nextCodepoint(text, 2));
+    // 'щ' is two bytes: stepping forward from its start lands after both.
+    try testing.expectEqual(@as(usize, 4), nextCodepoint(text, 2));
     try testing.expectEqual(@as(usize, 2), prevCodepoint(text, 3));
     try testing.expectEqual(@as(usize, 0), prevCodepoint(text, 0));
     try testing.expectEqual(text.len, nextCodepoint(text, text.len));

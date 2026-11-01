@@ -71,6 +71,16 @@ file, so it can be browsed with no peer at all. Quote a link in a shell: `?` and
 A mount that never produces metadata is reported as `ошибка` after three
 minutes, with the last line of the daemon's log as the reason.
 
+## The room shortcut
+
+The third shortcut under the source line, `История reKarma`, opens the default
+rekarma room in the left panel: the last messages rekarma recorded, refreshed as
+they arrive. Nothing in ziggurat links librats, so the panel tails the file plain
+`rekarma` writes itself — `all.txt` in the directory ziggurat was started from —
+and starts `rekarma --daemon` when no recorder is running (`all.txt.pid` is how
+it tells). The recorder outlives the interface like a mount; Enter again hides
+the panel, `kill $(cat all.txt.pid)` stops the recording.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

@@ -5,6 +5,15 @@ const procs = @import("procs.zig");
 const term = @import("term.zig");
 const tui = @import("tui.zig");
 
+test {
+    // A module reached only from `main()` is never analyzed in a test build, so
+    // its own `test` blocks would drop out of the artifact without a word:
+    // naming the imports here is what keeps `zig build test` covering the screen
+    // and the terminal at all.
+    _ = tui;
+    _ = term;
+}
+
 /// What the command line asked for. Kept separate from `main` so the parser is
 /// testable without a process.
 pub const Command = union(enum) {

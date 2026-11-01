@@ -73,6 +73,18 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
 
 ## Pitfalls
 
+- **The room panel tails `all.txt` in the startup directory, not a file of its
+  own.** Plain `rekarma` records the room `rekarma` into `all.txt` (pid
+  `all.txt.pid`, log `all.txt.log`) beside where it runs, and ziggurat only reads
+  that file — putting the history in a ziggurat-owned path would show an empty
+  panel next to a recorder writing elsewhere. The link starts `rekarma --daemon`
+  itself when `all.txt.pid` names no live process, and the file is re-read only
+  when its size or mtime changes: one stat per tick, never a read per frame.
+- **A module whose `test` blocks matter must be named from a `test` block.** A
+  file reached only through `main()` is not analyzed in a test build, and its
+  tests drop out of the artifact silently (`tui.zig`, `term.zig` did until
+  `main.zig` gained a `test { _ = tui; _ = term; }`); `zig build test --summary
+  all` showing fewer tests than `grep -c '^test ' src/*.zig` is that bug.
 - **Do not add a librats dependency back to ziggurat.** The library belongs to
   rekarma, the binary that mounts and downloads; ziggurat only spawns it and asks
   for `--version`. Linking it again reintroduces the per-triple C++ vendoring,

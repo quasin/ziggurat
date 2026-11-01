@@ -111,6 +111,10 @@ pub fn unmount(io: Io, cache_dir: []const u8) bool {
 fn readPid(io: Io, cache_dir: []const u8) ?std.posix.pid_t {
     var buf: [64]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/magnet.pid", .{cache_dir}) catch return null;
+    return readPidFile(io, path);
+}
+
+fn readPidFile(io: Io, path: []const u8) ?std.posix.pid_t {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer file.close(io);
 
@@ -118,6 +122,44 @@ fn readPid(io: Io, cache_dir: []const u8) ?std.posix.pid_t {
     const n = file.readStreaming(io, &.{&text}) catch return null;
     const trimmed = std.mem.trim(u8, text[0..n], " \t\r\n");
     return std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch null;
+}
+
+/// The room plain `rekarma` records with no option at all: the default room is
+/// called `rekarma`, its file is `all.txt` in the directory the program was
+/// started from, and the recorder's pid and log sit beside it. Reading that file
+/// is what puts the room's history on screen without linking librats into
+/// ziggurat — the same reason `--version` asks the binary instead.
+pub const room_file = "all.txt";
+pub const room_pid_file = "all.txt.pid";
+
+/// Where the recorder's own output goes, for the status line: rekarma names the
+/// daemon's log after the room's file.
+pub const room_log_file = "all.txt.log";
+
+/// Whether something is recording the default room right now. A pid file left by
+/// a run that ended names a process that is not there any more, and /proc is the
+/// cheap way to tell the two apart — this is polled by the screen, so it must not
+/// spawn anything.
+pub fn recorderRunning(io: Io) bool {
+    const pid = readPidFile(io, room_pid_file) orelse return false;
+    var buf: [48]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "/proc/{d}", .{pid}) catch return false;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+/// Starts `rekarma --daemon` with no other argument: the recorder of the default
+/// room. Like a mount it forks and exits at once, so this returning says nothing
+/// about the file growing — `recorderRunning` is what the caller polls.
+pub fn startRecorder(io: Io, exe: []const u8) !void {
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ exe, "--daemon" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const term = try child.wait(io);
+    if (term != .exited or term.exited != 0) return error.RecorderStartFailed;
 }
 
 /// Hands a file inside the mount to the player. The path stays inside the
