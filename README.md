@@ -88,6 +88,26 @@ same machine reaches the room even when mDNS and the DHT cannot route between
 two nodes on one host. The recorder outlives the interface like a mount;
 `kill $(cat all.txt.pid)` stops the recording.
 
+## The RuTracker dump viewer
+
+The `База RuTracker.Org` shortcut under the source line turns the right panel
+into a search over the RuTracker.Org dump (`rutracker-*.xml`, the file
+`Install RuTracker.Org DataBase` unpacks into the startup directory). Type a
+query, press Enter, and the file is streamed — nothing is loaded, searched or
+indexed up front; a match list fills as records come in.
+
+    Enter    scan the dump for the typed query (or mount the selected match)
+    ↓        move into the matches; ↑ leaves them
+    Esc      back to the history, and stop a scan still running
+
+A match's magnet link (info-hash plus the tracker the dump names) goes into the
+source line and the release is mounted from there, exactly as if it had been
+pasted. The panel keeps at most 300 matches and stops scanning once it has
+them, so a common word answers in seconds and a rare one after one full pass
+(about 30 s for 30 GB from a warm page cache in a ReleaseSafe build; a Debug
+build scans several times slower). `rutracker-*.xml` is listed in `.gitignore`
+either way — it is tens of gigabytes.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

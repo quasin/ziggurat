@@ -38,6 +38,8 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
     src/procs.zig                spawning rekarma/player, mount probing, file scan, log tail,
                                  rekarma version lookup, background installers (ant-client,
                                  the RuTracker database)
+    src/rutracker.zig            the RuTracker dump: streaming search, record parsing, the
+                                 worker thread behind the viewer
     src/history.zig              the history rows and their tab-separated file
     src/magnet.zig               source normalization (magnet/.torrent), ids, media filter
 
@@ -102,6 +104,24 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
 - **`@import("build.zig.zon")` works only in `build.zig`**, not from `src/`
   (it resolves relative to the source file and fails with `FileNotFound`); code
   reads it through the generated `build_options` module.
+- **A 30 GB dump is searched by streaming, never by loading.** `rutracker-*.xml`
+  is ~31 GB and 5.7 million `<torrent>` records; the viewer's scan runs in a
+  worker thread (`rutracker.Engine`) that reads 1 MB chunks, splits complete
+  records and appends matches under a spinlock. The screen only reads atomics
+  for progress and `tryLock`s the list, so a scan never stalls a frame. Cancel
+  is checked per chunk, which is why leaving the view (`db.stop()`) returns in
+  milliseconds. Do not "optimise" this into a full read: a per-query allocation
+  of tens of gigabytes is the failure mode the design exists to avoid. A Debug
+  build scans at ~280 MB/s and a ReleaseSafe one at ~1.1 GB/s (disk-bound), so
+  the dump view is what `zig build dist` is for.
+- **The scan's record boundary is found with a single-byte scan for `<`.**
+  `std.mem.indexOf` with a multi-byte needle is byte-at-a-time Boyer-Moore in a
+  Debug build; `indexOfScalarPos('<')` plus a `startsWith` is several times
+  faster there and identical in ReleaseSafe. `recordEnd` is that path; keep it.
+- The dump's structure is one `<torrent id=… size=…>` per release with
+  `<title>`, `<torrent hash=… tracker_id=…/>` and `<forum>` inside. `parseRecord`
+  skips a malformed record instead of aborting the scan — 5.7 million records
+  are not all clean.
 - Default target is **`x86_64` baseline**, not native: a native build SIGILLs on
   older machines. Pass `-Dcpu=native` deliberately. `zig build dist` is
   ReleaseSafe + stripped (~2 MB per binary).

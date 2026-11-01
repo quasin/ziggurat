@@ -7,6 +7,7 @@ const term = @import("term.zig");
 const magnet = @import("magnet.zig");
 const history = @import("history.zig");
 const procs = @import("procs.zig");
+const rutracker = @import("rutracker.zig");
 
 /// One frame per 120 ms: fast enough that a mount appears as it comes up, slow
 /// enough that redrawing costs nothing while the user reads.
@@ -62,10 +63,11 @@ const Runtime = struct {
 };
 
 const Focus = enum { input, history };
-/// What the right panel shows: the mount history, a release's files, or the
-/// reKarma room. The room is a view rather than a popup because reading it and
-/// typing into it are the same act.
-const View = enum { history, files, room };
+/// What the right panel shows: the mount history, a release's files, the
+/// reKarma room, or the RuTracker dump. The room is a view rather than a popup
+/// because reading it and typing into it are the same act; the dump is one
+/// because searching it and mounting what it finds are the same act too.
+const View = enum { history, files, room, database };
 
 /// The shortcuts under the source line: fixed one-shot jobs, each with its own
 /// log, not history entries. `↓` walks them, Enter runs the selected one. The
@@ -75,10 +77,11 @@ const Link = struct {
     label: []const u8,
     action: Action,
 };
-const Action = enum { autonomi_install, rutracker_database, room_history };
+const Action = enum { autonomi_install, rutracker_database, rutracker_view, room_history };
 const links = [_]Link{
     .{ .label = "Autonomi Install", .action = .autonomi_install },
     .{ .label = "Install RuTracker.Org DataBase", .action = .rutracker_database },
+    .{ .label = "База RuTracker.Org", .action = .rutracker_view },
     .{ .label = "История reKarma", .action = .room_history },
 };
 
@@ -172,6 +175,23 @@ pub const App = struct {
     pending_len: usize = 0,
     pending_since: u64 = 0,
 
+    /// The RuTracker dump viewer. `db_path` is the `rutracker-*.xml` found in
+    /// the startup directory, kept as an owned copy because the scan thread
+    /// borrows it; `db_query` is the line typed into the panel.
+    db_path: ?[]u8 = null,
+    db: rutracker.Engine,
+    db_query: std.ArrayList(u8),
+    db_cursor: usize = 0,
+    /// Whether ↑↓ and Enter act on the results instead of the query line.
+    db_results_focus: bool = false,
+    db_selected: usize = 0,
+    db_scroll: usize = 0,
+    /// How many result rows the last frame had room for.
+    db_rows: usize = 0,
+    /// Set once the scan's outcome has been put on the status line, so it is
+    /// not rewritten every tick.
+    db_reported: bool = false,
+
     status_buf: [240]u8 = @splat(0),
     status_len: usize = 0,
     status_style: term.Style = .dim,
@@ -197,6 +217,8 @@ pub const App = struct {
             .room_lines = .empty,
             .compose = .empty,
             .players = .empty,
+            .db = rutracker.Engine.init(allocator),
+            .db_query = .empty,
         };
         try app.list.load(io, options.history_path);
         for (app.list.items.items) |entry| {
@@ -231,6 +253,9 @@ pub const App = struct {
         self.room_lines.deinit(self.allocator);
         self.compose.deinit(self.allocator);
         self.players.deinit(self.allocator);
+        self.db.deinit();
+        self.db_query.deinit(self.allocator);
+        if (self.db_path) |path| self.allocator.free(path);
     }
 
     pub fn run(self: *App) !void {
@@ -276,6 +301,7 @@ pub const App = struct {
         switch (self.view) {
             .files => try self.handleFiles(key),
             .room => try self.handleRoom(key),
+            .database => try self.handleDatabase(key),
             .history => switch (self.focus) {
                 .input => try self.handleInput(key),
                 .history => {
@@ -324,6 +350,80 @@ pub const App = struct {
             .right => self.compose_cursor = nextCodepoint(self.compose.items, self.compose_cursor),
             else => {},
         }
+    }
+
+    /// Keys in the dump view: a printable key edits the search line, Enter
+    /// scans the file for it, ↓ walks the results, and Enter on one hands its
+    /// magnet link to the source line and mounts it.
+    fn handleDatabase(self: *App, key: term.Key) !void {
+        switch (key) {
+            .esc, .tab => {
+                // Leaving the view stops a scan still running: a mount the
+                // user went back to watch must not compete with the dump for
+                // the disk. The matches collected so far stay on screen when
+                // the view is opened again.
+                self.db.stop();
+                self.view = .history;
+                self.focus = .input;
+                self.db_results_focus = false;
+            },
+            .enter => if (self.db_results_focus)
+                try self.mountDatabaseResult(self.db_selected)
+            else
+                try self.searchDatabase(),
+            .down => {
+                if (self.db.found.load(.monotonic) == 0) return;
+                self.db_results_focus = true;
+                self.db_selected +|= 1;
+                self.clampDatabaseSelection();
+            },
+            .up => {
+                if (!self.db_results_focus) return;
+                if (self.db_selected == 0) {
+                    self.db_results_focus = false;
+                    return;
+                }
+                self.db_selected -= 1;
+            },
+            .text => |bytes| {
+                // Typing always means editing the query, even after a search:
+                // the previous results stay on screen until Enter replaces them.
+                self.db_results_focus = false;
+                try self.db_query.insertSlice(self.allocator, self.db_cursor, bytes);
+                self.db_cursor += bytes.len;
+            },
+            .backspace => if (self.db_cursor > 0) {
+                self.db_results_focus = false;
+                const start = prevCodepoint(self.db_query.items, self.db_cursor);
+                try self.db_query.replaceRange(self.allocator, start, self.db_cursor - start, "");
+                self.db_cursor = start;
+            },
+            .delete => if (self.db_cursor < self.db_query.items.len) {
+                self.db_results_focus = false;
+                const end = nextCodepoint(self.db_query.items, self.db_cursor);
+                try self.db_query.replaceRange(self.allocator, self.db_cursor, end - self.db_cursor, "");
+            },
+            .left => self.db_cursor = prevCodepoint(self.db_query.items, self.db_cursor),
+            .right => self.db_cursor = nextCodepoint(self.db_query.items, self.db_cursor),
+            .home => self.db_cursor = 0,
+            .end => self.db_cursor = self.db_query.items.len,
+            .ctrl_u => {
+                self.db_query.clearRetainingCapacity();
+                self.db_cursor = 0;
+                self.db_results_focus = false;
+            },
+            else => {},
+        }
+    }
+
+    fn clampDatabaseSelection(self: *App) void {
+        const count: usize = @intCast(self.db.found.load(.monotonic));
+        if (count == 0) {
+            self.db_selected = 0;
+            self.db_results_focus = false;
+            return;
+        }
+        if (self.db_selected >= count) self.db_selected = count - 1;
     }
 
     /// Publishes the typed line with `rekarma <text>`: a one-shot send into the
@@ -588,7 +688,133 @@ pub const App = struct {
         switch (links[self.link_index].action) {
             .autonomi_install => try self.installAutonomi(),
             .rutracker_database => try self.downloadRutrackerDatabase(),
+            .rutracker_view => try self.openDatabase(),
             .room_history => try self.openRoom(),
+        }
+    }
+
+    /// Enter on the dump shortcut: the right panel becomes the searchable
+    /// RuTracker dump. The file is looked up in the startup directory — the
+    /// same place `Install RuTracker.Org DataBase` unpacks it — and a missing
+    /// one is a message with the shortcut that fixes it, not an empty list.
+    fn openDatabase(self: *App) !void {
+        self.link_selected = false;
+        self.view = .database;
+        self.focus = .history;
+        self.db_results_focus = false;
+        self.db_selected = 0;
+        self.db_scroll = 0;
+
+        const path = (try self.ensureDatabasePath()) orelse {
+            self.setStatus(
+                "rutracker-*.xml в каталоге запуска нет — скачайте базу ссылкой Install RuTracker.Org DataBase",
+                .warn,
+            );
+            return;
+        };
+
+        var buf: [240]u8 = undefined;
+        if (std.Io.Dir.cwd().statFile(self.io, path, .{})) |st| {
+            const text = std.fmt.bufPrint(&buf, "база: {s} · {d} ГБ · введите запрос и нажмите Enter", .{
+                std.fs.path.basename(path), st.size / (1 << 30),
+            }) catch "";
+            self.setStatus(text, .dim);
+        } else |_| {
+            self.setStatus("база найдена, но не читается", .err);
+        }
+    }
+
+    fn ensureDatabasePath(self: *App) !?[]const u8 {
+        if (self.db_path) |path| return path;
+        self.db_path = try findDatabase(self.allocator, self.io);
+        return self.db_path;
+    }
+
+    /// Enter on the query line: one streaming scan of the dump behind the
+    /// screen. The previous scan is cancelled first, so a refined query does not
+    /// have to wait for the first one to reach the end of 30 GB.
+    fn searchDatabase(self: *App) !void {
+        const path = (try self.ensureDatabasePath()) orelse {
+            self.setStatus(
+                "rutracker-*.xml в каталоге запуска нет — скачайте базу ссылкой Install RuTracker.Org DataBase",
+                .err,
+            );
+            return;
+        };
+        const query = std.mem.trim(u8, self.db_query.items, " \t");
+        if (query.len == 0) {
+            self.setStatus("пустой запрос — нечего искать", .warn);
+            return;
+        }
+        const st = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch {
+            self.setStatus("база не читается: файл пропал из каталога запуска", .err);
+            return;
+        };
+
+        self.db.start(path, query, st.size) catch |err| {
+            var buf: [200]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "поиск по базе: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+        self.db_results_focus = false;
+        self.db_selected = 0;
+        self.db_scroll = 0;
+        self.db_reported = false;
+
+        var buf: [220]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "поиск «{s}» по {d} ГБ базы · Esc — назад", .{ query, st.size / (1 << 30) }) catch "";
+        self.setStatus(text, .dim);
+    }
+
+    /// Enter on a result: its magnet link goes into the source line and the
+    /// release is mounted from there, exactly as if it had been pasted.
+    fn mountDatabaseResult(self: *App, index: usize) !void {
+        var result: rutracker.Result = undefined;
+        if (!self.db.resultAt(index, &result)) {
+            self.setStatus("выберите строку результата стрелками", .warn);
+            return;
+        }
+        var buf: [256]u8 = undefined;
+        const link = result.magnet(&buf) orelse {
+            self.setStatus("у результата нет info-hash — монтировать нечего", .err);
+            return;
+        };
+
+        self.input.clearRetainingCapacity();
+        try self.input.appendSlice(self.allocator, link);
+        self.cursor = self.input.items.len;
+
+        self.view = .history;
+        self.focus = .input;
+        self.db_results_focus = false;
+        try self.startFromInput();
+    }
+
+    /// Reports the scan's outcome once: a finished scan, one that hit the
+    /// result cap, or one whose file could not be read.
+    fn pollDatabase(self: *App) void {
+        if (self.db_reported) return;
+        const outcome: rutracker.Outcome = @fromBackingInt(@intCast(self.db.outcome.load(.acquire)));
+        if (outcome == .none) return;
+        self.db_reported = true;
+
+        const found = self.db.found.load(.monotonic);
+        var buf: [240]u8 = undefined;
+        switch (outcome) {
+            .done => {
+                const text = if (found == 0)
+                    std.fmt.bufPrint(&buf, "в базе ничего не найдено по этому запросу", .{}) catch ""
+                else
+                    std.fmt.bufPrint(&buf, "база прочитана: {d} совпадений · ↓ и Enter — смонтировать", .{found}) catch "";
+                self.setStatus(text, if (found == 0) .warn else .ok);
+            },
+            .stopped => {
+                const text = std.fmt.bufPrint(&buf, "найдено {d} — поиск остановлен на лимите, уточните запрос", .{found}) catch "";
+                self.setStatus(text, if (found == 0) .warn else .dim);
+            },
+            .failed => self.setStatus("не удалось прочитать базу: файл повреждён или это не дамп", .err),
+            .none => {},
         }
     }
 
@@ -866,6 +1092,10 @@ pub const App = struct {
         // and costs one stat when nothing arrived.
         if (self.view == .room) self.refreshRoom();
 
+        // A finished dump scan reports itself once; the panel reads the
+        // progress atomics while the worker is still running.
+        if (self.view == .database) self.pollDatabase();
+
         // A message waiting for the recorder's port is spawned here, out of the
         // key handler: the wait is bounded in ticks, not in blocking calls.
         if (self.pending_len > 0) self.publishPending();
@@ -1025,10 +1255,12 @@ pub const App = struct {
         // its line, and drawing the borders afterwards keeps them intact.
         const cursor_at = self.drawInputPanel(&frame, top, 1, height, left_width);
         var room_cursor: ?[2]u16 = null;
+        var db_cursor: ?[2]u16 = null;
         switch (self.view) {
             .history => self.drawHistoryPanel(&frame, top, right_left, height, right_width),
             .files => self.drawFilesPanel(&frame, top, right_left, height, right_width),
             .room => room_cursor = self.drawRoomPanel(&frame, top, right_left, height, right_width),
+            .database => db_cursor = self.drawDatabasePanel(&frame, top, right_left, height, right_width),
         }
         frame.at(top, size.cols);
         frame.endRow();
@@ -1040,14 +1272,19 @@ pub const App = struct {
             .history => "История",
             .files => "Файлы релиза",
             .room => "Комната reKarma",
+            .database => "База RuTracker.Org",
         });
 
         self.drawFooter(&frame, size);
 
         // The cursor is only shown where typing goes; everywhere else the
         // selection highlight is the pointer. In the room that is the compose
-        // line, not the source line.
-        const typing_at = if (self.view == .room) room_cursor else cursor_at;
+        // line, not the source line; in the dump it is the query.
+        const typing_at = switch (self.view) {
+            .room => room_cursor,
+            .database => db_cursor,
+            else => cursor_at,
+        };
         if (typing_at) |pos| {
             frame.at(pos[0], pos[1]);
             frame.showCursor();
@@ -1247,6 +1484,89 @@ pub const App = struct {
         return .{ compose_row, @min(cursor_col, left + width - 2) };
     }
 
+    /// The RuTracker dump, right panel: a search line, how far the scan has
+    /// got, and the releases it matched. Enter on a row mounts it, so a search
+    /// ends in the same place a pasted magnet does.
+    fn drawDatabasePanel(self: *App, frame: *term.Frame, top: u16, left: u16, height: u16, width: u16) ?[2]u16 {
+        const inner_width: u16 = width -| 2;
+
+        const query_row = top + 1;
+        const prompt_width: u16 = inner_width -| 4;
+        const cursor_cols = term.displayWidth(self.db_query.items[0..self.db_cursor]);
+        const offset = if (cursor_cols >= prompt_width) cursor_cols - prompt_width + 1 else 0;
+        frame.at(query_row, left + 1);
+        frame.put(if (self.db_results_focus) .dim else .accent, if (self.db_results_focus) " " else ">");
+        frame.put(.plain, " ");
+        frame.put(.plain, skipCols(self.db_query.items, offset));
+        if (self.db_query.items.len == 0) frame.put(.dim, "запрос по базе RuTracker · Enter — искать");
+        frame.endRow();
+
+        const scanned = self.db.scanned.load(.monotonic);
+        const total = self.db.total.load(.monotonic);
+        const found = self.db.found.load(.monotonic);
+        var head_buf: [160]u8 = undefined;
+        const head = if (self.db.running.load(.monotonic))
+            std.fmt.bufPrint(&head_buf, "читаю {d} МБ из {d} МБ · найдено {d}", .{
+                scanned / (1 << 20), total / (1 << 20), found,
+            }) catch ""
+        else if (found > 0)
+            std.fmt.bufPrint(&head_buf, "найдено {d} · ↓ — выбор · Enter — смонтировать", .{found}) catch ""
+        else if (self.db_path) |path|
+            std.fmt.bufPrint(&head_buf, "{s}", .{std.fs.path.basename(path)}) catch ""
+        else
+            "rutracker-*.xml в каталоге запуска не найден";
+        frame.at(top + 2, left + 2);
+        frame.put(.dim, truncateTo(head, inner_width -| 1));
+        frame.endRow();
+
+        // Rows of results, the query and the progress line taking the rest.
+        const rows: usize = if (height > 4) height - 4 else 0;
+        self.db_rows = rows;
+        if (self.db_selected < self.db_scroll) self.db_scroll = self.db_selected;
+        if (rows > 0 and self.db_selected >= self.db_scroll + rows) {
+            self.db_scroll = self.db_selected - rows + 1;
+        }
+
+        if (self.db.mutex.tryLock()) {
+            defer self.db.mutex.unlock();
+            const items = self.db.results.items;
+            var i: usize = 0;
+            while (i < rows and self.db_scroll + i < items.len) : (i += 1) {
+                const index = self.db_scroll + i;
+                const result = &items[index];
+                const selected = self.db_results_focus and index == self.db_selected;
+                const row = top + 3 + @as(u16, @intCast(i));
+
+                var size_buf: [24]u8 = undefined;
+                const size = sizeText(&size_buf, result.size);
+                const room_i: i32 = @as(i32, inner_width) - @as(i32, term.displayWidth(size)) - 6;
+                const room: u16 = @intCast(@max(room_i, 4));
+
+                frame.at(row, left + 1);
+                frame.put(if (selected) .selected else .dim, if (selected) "▸" else " ");
+                frame.put(if (selected) .selected else .plain, " ");
+                frame.put(if (selected) .selected else .plain, truncateTo(result.title, room));
+                frame.put(if (selected) .selected else .dim, "  ");
+                frame.put(if (selected) .selected else .dim, size);
+                frame.endRow();
+            }
+        } else {
+            // The worker holds the lock only while it appends a match; when it
+            // does, the frame shows the progress line without the list rather
+            // than blocking the screen on it.
+            const row = top + 3;
+            if (row + 1 < top + height) {
+                frame.at(row, left + 2);
+                frame.put(.dim, "…");
+                frame.endRow();
+            }
+        }
+
+        if (self.db_results_focus) return null;
+        const cursor_col = left + 3 + (cursor_cols - offset);
+        return .{ query_row, @min(cursor_col, left + width - 2) };
+    }
+
     fn drawHistoryPanel(self: *App, frame: *term.Frame, top: u16, left: u16, height: u16, width: u16) void {
         const rows = height - 2;
         const inner_width = width - 2;
@@ -1342,11 +1662,40 @@ pub const App = struct {
             },
             .files => "↑↓ — файл · Enter — vlc · Esc — назад · Ctrl-C — выход",
             .room => "Enter — отправить · ↑↓ — прокрутка · Home/End · Esc — назад · Ctrl-C — выход",
+            .database => "Enter — поиск · ↓ — результаты · Enter — смонтировать · Esc — назад",
         };
         frame.put(.dim, hints);
         frame.endRow();
     }
 };
+
+/// The dump the viewer reads: the newest `rutracker-*.xml` in the startup
+/// directory, which is where the download shortcut unpacks it. A copy of the
+/// name is returned because the path outlives the scan thread that reads it.
+fn findDatabase(allocator: std.mem.Allocator, io: Io) !?[]u8 {
+    var dir = std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    var best: ?[]u8 = null;
+    errdefer if (best) |path| allocator.free(path);
+    var best_ns: i96 = std.math.minInt(i96);
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "rutracker-")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".xml")) continue;
+
+        const st = std.Io.Dir.cwd().statFile(io, entry.name, .{}) catch continue;
+        if (st.mtime.nanoseconds <= best_ns) continue;
+
+        const copy = try allocator.dupe(u8, entry.name);
+        if (best) |old| allocator.free(old);
+        best = copy;
+        best_ns = st.mtime.nanoseconds;
+    }
+    return best;
+}
 
 fn sizeText(buf: []u8, bytes: u64) []const u8 {
     const units = [_][]const u8{ "Б", "КБ", "МБ", "ГБ", "ТБ" };

@@ -38,6 +38,11 @@ pub const usage =
     \\  release lists its media files; Enter on a file plays it with vlc, and the
     \\  player's reads are what pull the pieces out of the swarm.
     \\
+    \\  `↓` selects the shortcuts under the source line: the ant-client installer,
+    \\  the RuTracker.Org database download and its viewer, and the reKarma room.
+    \\  The viewer searches rutracker-*.xml from the startup directory and mounts
+    \\  the release of a chosen match.
+    \\
     \\  --help, -h          print this text and exit
     \\  --version, -V       print the version and exit
     \\

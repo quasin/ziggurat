@@ -1,0 +1,465 @@
+//! The RuTracker.Org dump (`rutracker-YYYYMMDD.xml`) as a searchable list.
+//!
+//! The file is tens of gigabytes, so nothing is loaded: a worker thread streams
+//! it in megabyte chunks, splits it into `<torrent …>…</torrent>` records and
+//! keeps the titles that match the query. The screen polls that worker instead
+//! of waiting for it, and a new query cancels the one in flight.
+//!
+//! The dump is written by the tracked user, not by us: one record per release,
+//! with the attributes this module reads
+//!
+//!     <torrent id="…" registred_at="…" size="…">
+//!      <title><![CDATA[…]]></title>
+//!      <torrent hash="…" tracker_id="4"/>
+//!      <forum id="…">…</forum>
+//!      <content><![CDATA[…]]></content>
+//!     </torrent>
+//!
+//! A record whose parts do not parse is skipped rather than aborting the scan:
+//! a 5-million-record file has room for a few odd ones, and stopping there
+//! would hide everything after them.
+const std = @import("std");
+
+/// Where a scan stops. A dump with 5.7 million releases answers a common word
+/// with thousands of hits; the panel can show a screen full, and scanning the
+/// remaining gigabytes to grow that list only delays the answer.
+pub const max_results: usize = 300;
+
+/// A release title is clipped here before it is stored: the panel truncates it
+/// to its width anyway, and a title longer than this is a release description
+/// pasted into the wrong field.
+pub const max_title: usize = 160;
+
+/// How much of a single record the buffer keeps before giving up on it. Content
+/// blocks are large (a release description can be tens of kilobytes) but not
+/// this large; a record that never closes means the file is not a dump.
+const max_record: usize = 16 << 20;
+
+/// The read size of the scanner. One megabyte is a few milliseconds from the
+/// page cache and keeps the cancel latency small.
+const chunk_size: usize = 1 << 20;
+
+pub const Result = struct {
+    title: []u8,
+    hash: [64]u8 = undefined,
+    hash_len: u8 = 0,
+    tracker_id: u32 = 1,
+    size: u64 = 0,
+
+    pub fn hashText(self: *const Result) []const u8 {
+        return self.hash[0..self.hash_len];
+    }
+
+    /// The magnet link the row stands for: the info-hash and the tracker the
+    /// dump names, so a release found here can be mounted straight away.
+    pub fn magnet(self: *const Result, buf: []u8) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "magnet:?xt=urn:btih:{s}&tr=http://bt{d}.t-ru.org/ann?magnet", .{
+            self.hashText(), self.tracker_id,
+        }) catch null;
+    }
+};
+
+/// What a scan reports when it is over. `running` is not part of it because the
+/// UI asks the atomics for that: the outcome is written once, a frame at a time.
+pub const Outcome = enum(u8) { none = 0, done = 1, failed = 2, stopped = 3 };
+
+pub const Engine = struct {
+    allocator: std.mem.Allocator,
+    /// Guards `results`. The worker appends a result at a time; the screen
+    /// holds it only while it copies a row out, never while it draws.
+    mutex: std.atomic.Mutex = .unlocked,
+    results: std.ArrayList(Result) = .empty,
+    /// The folded query, owned here so the worker can outlive the caller's
+    /// buffer. Written before the thread starts, read by it afterwards.
+    query: std.ArrayList(u8) = .empty,
+
+    scanned: std.atomic.Value(u64) = .init(0),
+    total: std.atomic.Value(u64) = .init(0),
+    found: std.atomic.Value(u64) = .init(0),
+    running: std.atomic.Value(bool) = .init(false),
+    cancel: std.atomic.Value(bool) = .init(false),
+    outcome: std.atomic.Value(u8) = .init(@backingInt(Outcome.none)),
+
+    thread: ?std.Thread = null,
+
+    pub fn init(allocator: std.mem.Allocator) Engine {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Engine) void {
+        self.stop();
+        self.clearResults();
+        self.results.deinit(self.allocator);
+        self.query.deinit(self.allocator);
+    }
+
+    /// Stops the scan in flight, if any, and waits for the thread: the engine's
+    /// buffers must not be freed under a worker still writing into them.
+    pub fn stop(self: *Engine) void {
+        self.cancel.store(true, .monotonic);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        self.running.store(false, .release);
+    }
+
+    pub fn clearResults(self: *Engine) void {
+        self.lock();
+        defer self.mutex.unlock();
+        for (self.results.items) |result| self.allocator.free(result.title);
+        self.results.clearRetainingCapacity();
+    }
+
+    /// Starts a scan of `path` for `text`. `total` is the file size, for the
+    /// progress line; `path` must outlive the scan (the app's own copy).
+    pub fn start(self: *Engine, path: []const u8, text: []const u8, total: u64) !void {
+        self.stop();
+        self.cancel.store(false, .monotonic);
+        self.clearResults();
+
+        self.query.clearRetainingCapacity();
+        var folded: [256]u8 = undefined;
+        try self.query.appendSlice(self.allocator, fold(&folded, text));
+
+        self.found.store(0, .monotonic);
+        self.scanned.store(0, .monotonic);
+        self.total.store(total, .monotonic);
+        self.outcome.store(@backingInt(Outcome.none), .monotonic);
+        self.running.store(true, .release);
+
+        self.thread = try std.Thread.spawn(.{}, worker, .{ self, path });
+    }
+
+    fn lock(self: *Engine) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Copies one result out for the screen, or null when the list is shorter
+    /// than that. Taken under the lock so the title slice stays valid while the
+    /// caller builds the link.
+    pub fn resultAt(self: *Engine, index: usize, out: *Result) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        if (index >= self.results.items.len) return false;
+        out.* = self.results.items[index];
+        return true;
+    }
+
+    fn worker(self: *Engine, path: []const u8) void {
+        var stopped = false;
+        self.scanFile(path) catch {
+            self.outcome.store(@backingInt(Outcome.failed), .release);
+            self.running.store(false, .release);
+            return;
+        };
+        // A scan that returned without being cancelled finished the file; one
+        // that hit the result cap or the cancel flag is a partial answer, and
+        // the panel says which.
+        if (self.cancel.load(.monotonic)) {
+            stopped = true;
+        } else if (self.found.load(.monotonic) >= max_results) {
+            stopped = true;
+        }
+        self.outcome.store(@backingInt(if (stopped) Outcome.stopped else Outcome.done), .release);
+        self.running.store(false, .release);
+    }
+
+    fn scanFile(self: *Engine, path: []const u8) !void {
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{}, 0);
+        defer _ = std.os.linux.close(fd);
+
+        // The buffer grows across reads because a record straddles chunk
+        // boundaries; it is trimmed after every processed record.
+        var pending: std.ArrayList(u8) = .empty;
+        defer pending.deinit(self.allocator);
+        try pending.ensureTotalCapacity(self.allocator, chunk_size * 2);
+
+        var chunk: [chunk_size]u8 = undefined;
+        var scanned: u64 = 0;
+        while (true) {
+            if (self.cancel.load(.monotonic)) return;
+            const n = try std.posix.read(fd, &chunk);
+            if (n == 0) break;
+            scanned += n;
+            self.scanned.store(scanned, .monotonic);
+            try consume(self, &pending, chunk[0..n]);
+            if (self.found.load(.monotonic) >= max_results) return;
+            if (pending.items.len > max_record) return error.RecordTooLong;
+        }
+        // A file whose last record has no closing tag is still worth the
+        // matches already collected; nothing after it can be read anyway.
+    }
+
+    /// Appends the matches of every complete record in `pending`. Records are
+    /// consumed from the front, and an incomplete tail is kept for the next
+    /// read. Split out of `scanFile` so the parser is testable on bytes.
+    fn consume(self: *Engine, pending: *std.ArrayList(u8), chunk: []const u8) !void {
+        try pending.appendSlice(self.allocator, chunk);
+        try consumeRecords(self, pending);
+    }
+
+    fn consumeRecords(self: *Engine, pending: *std.ArrayList(u8)) !void {
+        var used: usize = 0;
+        while (true) {
+            if (self.found.load(.monotonic) >= max_results) break;
+            const rest = pending.items[used..];
+            const open_at = std.mem.indexOf(u8, rest, "<torrent ") orelse break;
+            const record_start = used + open_at;
+            const end = recordEnd(pending.items, record_start + 1) orelse break;
+            try self.consider(pending.items[record_start..end]);
+            used = end;
+        }
+
+        // Keep only what may still turn into a record: a partial opening tag or
+        // a record whose closing tag has not arrived yet.
+        if (used > 0) {
+            const left = pending.items.len - used;
+            std.mem.copyForwards(u8, pending.items[0..left], pending.items[used..]);
+            pending.shrinkRetainingCapacity(left);
+        }
+        if (std.mem.indexOf(u8, pending.items, "<torrent ") == null) {
+            // No opening tag in the buffer: keep only the tail that could be
+            // the first half of one split by the chunk boundary, and drop the
+            // content of records that were already consumed.
+            const want = "<torrent ";
+            var keep: usize = 0;
+            var k: usize = 1;
+            while (k < want.len and k <= pending.items.len) : (k += 1) {
+                if (std.mem.eql(u8, pending.items[pending.items.len - k ..], want[0..k])) keep = k;
+            }
+            const drop = pending.items.len - keep;
+            if (drop > 0) {
+                std.mem.copyForwards(u8, pending.items[0..keep], pending.items[pending.items.len - keep ..]);
+                pending.shrinkRetainingCapacity(keep);
+            }
+        }
+    }
+
+    fn consider(self: *Engine, block: []const u8) !void {
+        const parsed = parseRecord(block) orelse return;
+        var folded: [1024]u8 = undefined;
+        if (!self.matches(parsed.title, parsed.hash, &folded)) return;
+
+        const copy = try self.allocator.dupe(u8, clipTitle(parsed.title));
+        errdefer self.allocator.free(copy);
+
+        var result = Result{ .title = copy, .tracker_id = parsed.tracker_id, .size = parsed.size };
+        const hash_len = @min(parsed.hash.len, result.hash.len);
+        @memcpy(result.hash[0..hash_len], parsed.hash[0..hash_len]);
+        result.hash_len = @intCast(hash_len);
+
+        self.lock();
+        defer self.mutex.unlock();
+        try self.results.append(self.allocator, result);
+        _ = self.found.fetchAdd(1, .monotonic);
+    }
+
+    fn matches(self: *const Engine, title: []const u8, hash: []const u8, buf: []u8) bool {
+        const query = self.query.items;
+        if (query.len == 0) return false;
+        // An info-hash pasted into the search line is a hash lookup, not a
+        // substring of a title.
+        if (query.len == hash.len and query.len >= 32) {
+            return std.ascii.eqlIgnoreCase(query, hash);
+        }
+        return std.mem.indexOf(u8, fold(buf, title), query) != null;
+    }
+};
+
+/// The end of the record that starts at `from`, as an index just past its
+/// `</torrent>`. The search is a vectorized scan for `<`, which is the only
+/// fast byte scan Zig's std offers in a Debug build: a multi-byte needle costs
+/// a byte-at-a-time Boyer-Moore there, and that is the whole 30 GB scan.
+fn recordEnd(buf: []const u8, from: usize) ?usize {
+    var at = from;
+    while (std.mem.indexOfScalarPos(u8, buf, at, '<')) |lt| {
+        if (std.mem.startsWith(u8, buf[lt..], "</torrent>")) return lt + "</torrent>".len;
+        at = lt + 1;
+    }
+    return null;
+}
+
+pub const Parsed = struct {
+    title: []const u8,
+    hash: []const u8,
+    tracker_id: u32 = 1,
+    size: u64 = 0,
+};
+
+/// The parts of one `<torrent …>…</torrent>` block this module needs. Null when
+/// the block does not have them, which is how a malformed record is skipped.
+pub fn parseRecord(block: []const u8) ?Parsed {
+    const open_end = std.mem.indexOfScalar(u8, block, '>') orelse return null;
+    const size_text = attrValue(block[0..open_end], "size") orelse return null;
+    const size = std.fmt.parseInt(u64, size_text, 10) catch return null;
+
+    const title_start = std.mem.indexOf(u8, block, "<title>") orelse return null;
+    const title_end = std.mem.indexOfPos(u8, block, title_start, "</title>") orelse return null;
+    var title = std.mem.trim(u8, block[title_start + "<title>".len .. title_end], " \t\r\n");
+    if (std.mem.startsWith(u8, title, "<![CDATA[")) title = title["<![CDATA[".len..];
+    if (std.mem.endsWith(u8, title, "]]>")) title = title[0 .. title.len - "]]>".len];
+    if (title.len == 0) return null;
+
+    // The hash is the inner `<torrent hash="…"/>`, never the outer element:
+    // only the part after the opening tag is searched.
+    const hash_at = std.mem.indexOfPos(u8, block, open_end, "<torrent hash=\"") orelse return null;
+    const hash_start = hash_at + "<torrent hash=\"".len;
+    const hash_end = std.mem.indexOfScalarPos(u8, block, hash_start, '"') orelse return null;
+    const hash = block[hash_start..hash_end];
+    if (hash.len == 0 or hash.len > 64) return null;
+
+    const tracker_id = if (attrValue(block[open_end..], "tracker_id")) |text|
+        std.fmt.parseInt(u32, text, 10) catch 1
+    else
+        1;
+
+    return .{ .title = title, .hash = hash, .tracker_id = tracker_id, .size = size };
+}
+
+/// `name="value"` inside an attribute list. The quote is part of the marker so
+/// a title containing `size=` in its CDATA cannot be mistaken for an attribute.
+fn attrValue(tag: []const u8, name: []const u8) ?[]const u8 {
+    var marker_buf: [24]u8 = undefined;
+    const marker = std.fmt.bufPrint(&marker_buf, "{s}=\"", .{name}) catch return null;
+    const at = std.mem.indexOf(u8, tag, marker) orelse return null;
+    const rest = tag[at + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    return rest[0..end];
+}
+
+fn clipTitle(title: []const u8) []const u8 {
+    if (title.len <= max_title) return title;
+    var end = max_title;
+    // Do not cut a UTF-8 sequence in half: the panel prints these bytes.
+    while (end > 0 and (title[end] & 0xc0) == 0x80) end -= 1;
+    return title[0..end];
+}
+
+/// Lowercases what the dump and the keyboard contain: ASCII and the Russian
+/// block of Cyrillic. Everything else is copied unchanged, which only makes the
+/// search stricter, never wrong.
+pub fn fold(buf: []u8, text: []const u8) []const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const byte = text[i];
+        if (n + 2 > buf.len) break;
+        if (byte < 0x80) {
+            buf[n] = std.ascii.toLower(byte);
+            n += 1;
+            continue;
+        }
+        if (i + 1 >= text.len) break;
+        const next = text[i + 1];
+        // А-Я (U+0410..U+042F, D0 90..D0 AF) → а-я (U+0430..U+044F).
+        if (byte == 0xd0 and next >= 0x90 and next <= 0xaf) {
+            const offset = next - 0x90;
+            if (offset < 16) {
+                buf[n] = 0xd0;
+                buf[n + 1] = 0xb0 + offset;
+            } else {
+                buf[n] = 0xd1;
+                buf[n + 1] = 0x80 + (offset - 16);
+            }
+            n += 2;
+            i += 1;
+            continue;
+        }
+        // Ё (U+0401, D0 81) → ё (U+0451, D1 91).
+        if (byte == 0xd0 and next == 0x81) {
+            buf[n] = 0xd1;
+            buf[n + 1] = 0x91;
+            n += 2;
+            i += 1;
+            continue;
+        }
+        buf[n] = byte;
+        buf[n + 1] = next;
+        n += 2;
+        i += 1;
+    }
+    return buf[0..n];
+}
+
+const testing = std.testing;
+
+test "rutracker: a record yields its title, hash, tracker and size" {
+    const block =
+        \\<torrent id="6499008" registred_at="2024.03.12 20:11:00" unixts="1710263460" size="498667923">
+        \\ <title><![CDATA[[TR24][OF] Sferro & Tommy ‘86 - Remote Communications]]></title>
+        \\ <torrent hash="3D9E3C0F6D25349D055D82CFA6401BEE3C9509B2" tracker_id="4"/>
+        \\ <forum id="1893">Hi-Res форматы</forum>
+        \\ <content><![CDATA[[size=24]Sferro[/size] size="not an attribute"]]></content>
+        \\</torrent>
+    ;
+    const parsed = parseRecord(block).?;
+    try testing.expectEqualStrings("[TR24][OF] Sferro & Tommy ‘86 - Remote Communications", parsed.title);
+    try testing.expectEqualStrings("3D9E3C0F6D25349D055D82CFA6401BEE3C9509B2", parsed.hash);
+    try testing.expectEqual(@as(u32, 4), parsed.tracker_id);
+    try testing.expectEqual(@as(u64, 498667923), parsed.size);
+
+    // A record missing the hash cannot be mounted, so it is not a result.
+    const no_hash = "<torrent id=\"1\" size=\"2\">\n<title>x</title>\n</torrent>";
+    try testing.expect(parseRecord(no_hash) == null);
+}
+
+test "rutracker: the folded query matches Russian titles in either case" {
+    var buf: [1024]u8 = undefined;
+    const title = fold(&buf, "[Музыка] ПАТТЕРНЫ проектирования");
+    try testing.expectEqualStrings("[музыка] паттерны проектирования", title);
+
+    var query: [64]u8 = undefined;
+    try testing.expectEqualStrings("паттерны", fold(&query, "ПАТТЕРНЫ"));
+    try testing.expect(std.mem.indexOf(u8, title, fold(&query, "ПАТТЕРНЫ")) != null);
+
+    // Latin text keeps its spaces and punctuation.
+    var ascii: [32]u8 = undefined;
+    try testing.expectEqualStrings("sferro & tommy", fold(&ascii, "Sferro & Tommy"));
+}
+
+test "rutracker: the result builds the magnet the view mounts" {
+    var result = Result{ .title = @constCast("x") };
+    const hash = "3D9E3C0F6D25349D055D82CFA6401BEE3C9509B2";
+    @memcpy(result.hash[0..hash.len], hash);
+    result.hash_len = hash.len;
+    result.tracker_id = 4;
+
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings(
+        "magnet:?xt=urn:btih:3D9E3C0F6D25349D055D82CFA6401BEE3C9509B2&tr=http://bt4.t-ru.org/ann?magnet",
+        result.magnet(&buf).?,
+    );
+}
+
+test "rutracker: the scanner keeps every complete record across chunk edges" {
+    const a = testing.allocator;
+    var engine = Engine.init(a);
+    defer engine.deinit();
+
+    engine.query.clearRetainingCapacity();
+    try engine.query.appendSlice(a, "needle");
+
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(a);
+    try pending.ensureTotalCapacity(a, 512);
+
+    const first = "<torrent id=\"1\" size=\"10\">\n<title>needle one</title>\n<torrent hash=\"" ++
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" ++ "\" tracker_id=\"1\"/>\n</torrent>";
+    const second = "<torrent id=\"2\" size=\"20\">\n<title>other</title>\n<torrent hash=\"" ++
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" ++ "\" tracker_id=\"1\"/>\n</torrent>";
+
+    // Split the first record in the middle, exactly like a read boundary.
+    const cut = first.len / 2;
+    try engine.consume(&pending, first[0..cut]);
+    try testing.expectEqual(@as(u64, 0), engine.found.load(.monotonic));
+    try engine.consume(&pending, first[cut..]);
+    try engine.consume(&pending, second);
+    try testing.expectEqual(@as(u64, 1), engine.found.load(.monotonic));
+
+    var result: Result = undefined;
+    try testing.expect(engine.resultAt(0, &result));
+    try testing.expectEqualStrings("needle one", result.title);
+    try testing.expectEqual(@as(u64, 10), result.size);
+    try testing.expect(!engine.resultAt(1, &result));
+}

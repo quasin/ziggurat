@@ -10,3 +10,7 @@ zig-out/
 # releases, downloaded pieces and the history.
 mnt/
 .ziggurat/
+
+# The RuTracker dump the viewer reads: tens of gigabytes, never in the repo.
+rutracker-*.xml
+rutracker-*.xml.xz
