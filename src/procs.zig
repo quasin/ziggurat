@@ -148,30 +148,51 @@ pub fn reapIfDone(pid: std.posix.pid_t) bool {
     return linux.waitpid(pid, &status, linux.W.NOHANG) == pid;
 }
 
-/// The ant-client install pipeline. It needs a shell (`curl | bash`), and a
-/// child writing to this terminal would paint over the panels, so the whole
-/// pipeline's output is redirected into `log_path` and the interface stays
-/// interactive while the installer runs in the background.
-pub fn installCommand(buf: []u8, dir: []const u8, log_path: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(
-        buf,
-        "mkdir -p \"{s}\" && ( curl -fsSL https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh | bash ) >> \"{s}\" 2>&1",
-        .{ dir, log_path },
-    );
+pub const ant_client_url = "https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh";
+
+/// The RuTracker database source. The address is fixed, the archive has the
+/// upstream name, and `xz -d` turns it into the `.xml` beside it.
+pub const rutracker_address = "a74d01ff38a9a737cc009f54ae4bf4f0b03c446aa61e1c1d11fff5c6f6df06fc";
+pub const rutracker_archive = "rutracker-20261031.xml.xz";
+
+/// The ant-client installer is a curl|bash pipeline, so it needs a shell.
+pub fn antClientCommand(buf: []u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "curl -fsSL {s} | bash", .{ant_client_url});
 }
 
-/// Starts the installer without waiting for it: a slow download must not
-/// freeze the interface. The caller reaps the pid through `reap`.
-pub fn installAutonomi(io: Io, dir: []const u8, log_path: []const u8) !std.posix.pid_t {
-    var cmd_buf: [1024]u8 = undefined;
-    const command = try installCommand(&cmd_buf, dir, log_path);
+/// `xz -d -f` decompresses the archive in place and removes the `.xz`, which is
+/// exactly "unpack it next to the program and drop the original".
+pub fn rutrackerCommand(buf: []u8, ant: []const u8, xz: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\"{s}\" file download {s} -o {s} && \"{s}\" -d -f {s}", .{
+        ant, rutracker_address, rutracker_archive, xz, rutracker_archive,
+    });
+}
+
+/// Runs `command` through a shell with all of its output in `log_path`: a child
+/// writing to this terminal would paint over the panels. `dir` is created first
+/// because the log usually lives in the interface's own state directory.
+pub fn runInBackground(io: Io, command: []const u8, dir: []const u8, log_path: []const u8) !std.posix.pid_t {
+    var wrapped_buf: [4096]u8 = undefined;
+    const wrapped = try std.fmt.bufPrint(
+        &wrapped_buf,
+        "mkdir -p \"{s}\" && ( {s} ) >> \"{s}\" 2>&1",
+        .{ dir, command, log_path },
+    );
     const child = try std.process.spawn(io, .{
-        .argv = &.{ "/bin/sh", "-c", command },
+        .argv = &.{ "/bin/sh", "-c", wrapped },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
     });
     return child.id orelse error.NoPid;
+}
+
+/// Starts the installer without waiting for it: a slow download must not
+/// freeze the interface. The caller reaps the pid through `reapIfDone`.
+pub fn installAutonomi(io: Io, dir: []const u8, log_path: []const u8) !std.posix.pid_t {
+    var cmd_buf: [2048]u8 = undefined;
+    const command = try antClientCommand(&cmd_buf);
+    return runInBackground(io, command, dir, log_path);
 }
 
 pub const ToolVersions = struct {
@@ -336,12 +357,21 @@ test "procs: a program is found on PATH or not at all" {
     try testing.expect((try resolveExecutable(arena.allocator(), std.testing.io, "/nope/sh", null)) == null);
 }
 
-test "procs: the installer command carries the upstream script and the log" {
+test "procs: the installer command carries the upstream script" {
     var buf: [1024]u8 = undefined;
-    const cmd = try installCommand(&buf, ".ziggurat", ".ziggurat/autonomi-install.log");
+    const cmd = try antClientCommand(&buf);
     try testing.expect(std.mem.indexOf(u8, cmd, "https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "| bash") != null);
-    try testing.expect(std.mem.indexOf(u8, cmd, ".ziggurat/autonomi-install.log") != null);
+}
+
+test "procs: the rutracker command downloads, unpacks and drops the archive" {
+    var buf: [1024]u8 = undefined;
+    const cmd = try rutrackerCommand(&buf, "/usr/bin/ant", "/usr/bin/xz");
+    try testing.expect(std.mem.indexOf(u8, cmd, rutracker_address) != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "-o rutracker-20261031.xml.xz") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "-d -f rutracker-20261031.xml.xz") != null);
+    // xz -d removes the input unless -k is passed; the archive must be gone.
+    try testing.expect(std.mem.indexOf(u8, cmd, " -k ") == null);
 }
 
 test "procs: rekarma's version output is split into the two engines" {

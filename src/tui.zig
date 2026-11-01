@@ -64,6 +64,18 @@ const Runtime = struct {
 const Focus = enum { input, history };
 const View = enum { history, files };
 
+/// The shortcuts under the source line: fixed one-shot jobs, each with its own
+/// log, not history entries. `↓` walks them, Enter runs the selected one.
+const Link = struct {
+    label: []const u8,
+    action: Action,
+};
+const Action = enum { autonomi_install, rutracker_database };
+const links = [_]Link{
+    .{ .label = "Autonomi Install", .action = .autonomi_install },
+    .{ .label = "Install RuTracker.Org DataBase", .action = .rutracker_database },
+};
+
 pub const Options = struct {
     version: []const u8,
     /// The engine's own version, read from `rekarma --version` at startup:
@@ -75,6 +87,10 @@ pub const Options = struct {
     /// a failed spawn three keystrokes later.
     rekarma_exe: ?[]const u8,
     player_exe: ?[]const u8,
+    /// The two tools behind the RuTracker database link: `ant` fetches the
+    /// archive, `xz -d` unpacks it in place.
+    ant_exe: ?[]const u8 = null,
+    xz_exe: ?[]const u8 = null,
 };
 
 pub const App = struct {
@@ -89,9 +105,10 @@ pub const App = struct {
     input: std.ArrayList(u8),
     cursor: usize = 0,
     focus: Focus = .input,
-    /// Whether the install shortcut under the prompt is selected instead of
-    /// the input line. Enter there runs the ant-client installer, not a mount.
+    /// Whether the shortcuts under the prompt are selected instead of the input
+    /// line, and which one. Enter runs it, `↓`/`↑` move through the list.
     link_selected: bool = false,
+    link_index: usize = 0,
     view: View = .history,
     selected: usize = 0,
 
@@ -109,6 +126,8 @@ pub const App = struct {
     /// The installer runs far longer than a player, so its pid stays here
     /// until `reapIfDone` sees it exit instead of being dropped after one poll.
     install_pid: ?std.posix.pid_t = null,
+    /// The RuTracker database download/unpack, reaped the same way.
+    download_pid: ?std.posix.pid_t = null,
     tick: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, config: procs.Config, options: Options) !App {
@@ -214,9 +233,16 @@ pub const App = struct {
         // so the first character lands in the input line as usual.
         if (self.link_selected) {
             switch (key) {
-                .down => return,
+                .down => {
+                    self.link_index = (self.link_index + 1) % links.len;
+                    return;
+                },
                 .up => {
-                    self.link_selected = false;
+                    if (self.link_index == 0) {
+                        self.link_selected = false;
+                    } else {
+                        self.link_index -= 1;
+                    }
                     return;
                 },
                 .esc => {
@@ -225,7 +251,7 @@ pub const App = struct {
                     self.cursor = 0;
                     return;
                 },
-                .enter => return self.installAutonomi(),
+                .enter => return self.runLink(),
                 .tab => {
                     self.link_selected = false;
                     if (self.list.items.items.len > 0) self.focus = .history;
@@ -253,7 +279,10 @@ pub const App = struct {
             .right => self.cursor = nextCodepoint(self.input.items, self.cursor),
             .home => self.cursor = 0,
             .end => self.cursor = self.input.items.len,
-            .down => self.link_selected = true,
+            .down => {
+                self.link_selected = true;
+                self.link_index = 0;
+            },
             .ctrl_u => {
                 self.input.clearRetainingCapacity();
                 self.cursor = 0;
@@ -386,6 +415,53 @@ pub const App = struct {
 
         var buf: [240]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, "установщик ant-client запущен · лог: {s}", .{log_path}) catch "установщик ant-client запущен";
+        self.setStatus(text, .ok);
+        self.link_selected = false;
+    }
+
+    fn runLink(self: *App) !void {
+        switch (links[self.link_index].action) {
+            .autonomi_install => try self.installAutonomi(),
+            .rutracker_database => try self.downloadRutrackerDatabase(),
+        }
+    }
+
+    /// Enter on the RuTracker shortcut: `ant file download` fetches the archive
+    /// and `xz -d -f` unpacks it in the startup directory (the program's own
+    /// folder), removing the archive by itself. Backgrounded like the installer,
+    /// with the tool output in a log rather than over the panels.
+    fn downloadRutrackerDatabase(self: *App) !void {
+        const ant = self.options.ant_exe orelse {
+            self.setStatus("ant не найден в PATH — установите ant-client", .err);
+            return;
+        };
+        const xz = self.options.xz_exe orelse {
+            self.setStatus("xz не найден в PATH — установите xz-utils", .err);
+            return;
+        };
+
+        var cmd_buf: [2048]u8 = undefined;
+        const command = procs.rutrackerCommand(&cmd_buf, ant, xz) catch {
+            self.setStatus("не удалось собрать команду загрузки базы", .err);
+            return;
+        };
+
+        const dir = std.fs.path.dirname(self.config.cache) orelse ".";
+        var log_buf: [512]u8 = undefined;
+        const log_path = std.fmt.bufPrint(&log_buf, "{s}/rutracker-install.log", .{dir}) catch {
+            self.setStatus("не удалось собрать путь к логу загрузки", .err);
+            return;
+        };
+        const pid = procs.runInBackground(self.io, command, dir, log_path) catch |err| {
+            var buf: [200]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "загрузка базы: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+        self.download_pid = pid;
+
+        var buf: [240]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "загрузка базы RuTracker запущена · лог: {s}", .{log_path}) catch "загрузка базы RuTracker запущена";
         self.setStatus(text, .ok);
         self.link_selected = false;
     }
@@ -541,6 +617,12 @@ pub const App = struct {
             if (procs.reapIfDone(pid)) {
                 self.install_pid = null;
                 self.setStatus("установщик ant-client завершён", .ok);
+            }
+        }
+        if (self.download_pid) |pid| {
+            if (procs.reapIfDone(pid)) {
+                self.download_pid = null;
+                self.setStatus("база RuTracker распакована · rutracker-20261031.xml", .ok);
             }
         }
     }
@@ -750,21 +832,22 @@ pub const App = struct {
         }
         frame.endRow();
 
-        // The install shortcut sits under the prompt, so a fresh machine is one
-        // key away from the client. Down selects it, Enter runs the installer
-        // instead of mounting the line.
+        // The shortcuts under the prompt: `↓` selects them, Enter runs the job
+        // instead of mounting the line. Labels are clipped to the panel.
         const link_focused = focused and self.link_selected;
-        if (top + 2 < top + height - 1) {
-            frame.at(top + 2, left + 1);
-            frame.put(if (link_focused) .selected else .dim, if (link_focused) "▸ " else "  ");
-            frame.put(if (link_focused) .selected else .accent, "Autonomi Install");
-            frame.put(if (link_focused) .selected else .dim, "  curl | bash");
+        for (links, 0..) |link, i| {
+            const link_row = top + 2 + @as(u16, @intCast(i));
+            if (link_row >= top + height - 1) break;
+            const selected = link_focused and i == self.link_index;
+            frame.at(link_row, left + 1);
+            frame.put(if (selected) .selected else .dim, if (selected) "▸ " else "  ");
+            frame.put(if (selected) .selected else .accent, truncateTo(link.label, width -| 4));
             frame.endRow();
         }
 
         // Under the input: what the selected row is doing right now. A mount
         // waiting for the swarm must not look like a hung program.
-        var row = top + 3;
+        var row = top + 2 + @as(u16, @intCast(links.len));
         if (self.selected < self.list.items.items.len and row + 2 < top + height - 1) {
             const rt = &self.runtime.items[self.selected];
             const entry = self.list.items.items[self.selected];
@@ -792,7 +875,7 @@ pub const App = struct {
 
         if (row + 2 < top + height - 1) {
             frame.at(row + 1, left + 1);
-            frame.put(.dim, "Enter — смонтировать · ↓ — установщик");
+            frame.put(.dim, "Enter — выполнить · ↑↓ — ссылки");
             frame.at(row + 2, left + 1);
             frame.put(.dim, "Tab — к истории, Esc — очистить");
         }
@@ -892,7 +975,7 @@ pub const App = struct {
         frame.at(size.rows - 1, 1);
         const hints = switch (self.view) {
             .history => switch (self.focus) {
-                .input => "Ctrl-C — выход · Tab — история · Enter — смонтировать · ↓ — установщик",
+                .input => "Ctrl-C — выход · Tab — история · Enter — смонтировать · ↓ — ссылки",
                 .history => "↑↓ — выбор · Enter — открыть · u — отмонтировать · x — удалить · q — выход",
             },
             .files => "↑↓ — файл · Enter — vlc · Esc — назад · Ctrl-C — выход",

@@ -217,6 +217,8 @@ fn run(init: std.process.Init) !void {
             // spawn failure after the user has already pasted a magnet.
             const rekarma_exe = try procs.resolveExecutable(arena, init.io, options.config.rekarma, path_var);
             const player_exe = try procs.resolveExecutable(arena, init.io, options.config.player, path_var);
+            const ant_exe = try procs.resolveExecutable(arena, init.io, "ant", path_var);
+            const xz_exe = try procs.resolveExecutable(arena, init.io, "xz", path_var);
 
             // The engine answers for its own librats: ziggurat has no copy of
             // the library to ask, and the version shown must be the one the
@@ -232,6 +234,8 @@ fn run(init: std.process.Init) !void {
                 .history_path = options.history_path,
                 .rekarma_exe = rekarma_exe,
                 .player_exe = player_exe,
+                .ant_exe = ant_exe,
+                .xz_exe = xz_exe,
             });
             defer app.deinit();
             try app.run();

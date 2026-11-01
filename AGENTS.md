@@ -36,7 +36,8 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
     src/tui.zig                  App state, the two panels, the event loop, mount/play/install actions
     src/term.zig                 raw mode, key decoding, frame buffer (clipped, styled text)
     src/procs.zig                spawning rekarma/player, mount probing, file scan, log tail,
-                                 rekarma version lookup, the ant-client installer
+                                 rekarma version lookup, background installers (ant-client,
+                                 the RuTracker database)
     src/history.zig              the history rows and their tab-separated file
     src/magnet.zig               source normalization (magnet/.torrent), ids, media filter
 
@@ -125,7 +126,10 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
 - **A palette of escape codes per character is fine; an allocation per frame is
   not.** `frame.put()` writes style + text + reset each time, which keeps the
   buffer simple, but any `allocPrint` in a draw function leaks once per tick.
-- **A long-running child keeps its pid until it exits.** The installer stored in
-  `App.install_pid` is reaped with `procs.reapIfDone`, not the per-tick `players`
-  list: that list is cleared after one non-blocking `waitpid`, which would drop a
-  still-running pid and leave a zombie.
+- **A long-running child keeps its pid until it exits.** The ant-client
+  installer (`App.install_pid`) and the RuTracker download (`App.download_pid`)
+  are reaped with `procs.reapIfDone`, not the per-tick `players` list: that list
+  is cleared after one non-blocking `waitpid`, which would drop a still-running
+  pid and leave a zombie. Both jobs write their output to `.ziggurat/*.log`; the
+  RuTracker one downloads `rutracker-20261031.xml.xz` into the startup directory
+  and lets `xz -d` replace it with the `.xml`.

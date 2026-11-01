@@ -44,6 +44,7 @@ answer therefore describes the engine the mounts will actually run.
 ## Keys
 
     Enter    mount the source line / open the selected row / play a file
+    ↓        select a shortcut under the source line
     Tab      move between the input line and the history
     u        unmount the selected release
     x        forget the selected row
