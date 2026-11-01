@@ -119,7 +119,7 @@ pub const Engine = struct {
         self.clearResults();
 
         self.query.clearRetainingCapacity();
-        var folded: [256]u8 = undefined;
+        var folded: [1024]u8 = undefined;
         try self.query.appendSlice(self.allocator, fold(&folded, text));
 
         self.found.store(0, .monotonic);
@@ -256,14 +256,24 @@ pub const Engine = struct {
     }
 
     fn matches(self: *const Engine, title: []const u8, hash: []const u8, buf: []u8) bool {
-        const query = self.query.items;
+        const query = std.mem.trim(u8, self.query.items, " \t\r\n");
         if (query.len == 0) return false;
         // An info-hash pasted into the search line is a hash lookup, not a
         // substring of a title.
         if (query.len == hash.len and query.len >= 32) {
             return std.ascii.eqlIgnoreCase(query, hash);
         }
-        return std.mem.indexOf(u8, fold(buf, title), query) != null;
+        // Words separated by spaces are independent parts of the title: every
+        // one must occur, in any order, so `паттерн проект` finds both
+        // «Паттерны проектирования» and «Проектирование на паттернах».
+        const folded_title = fold(buf, title);
+        var terms = std.mem.tokenizeAny(u8, query, " \t\r\n");
+        var any = false;
+        while (terms.next()) |term| {
+            any = true;
+            if (std.mem.indexOf(u8, folded_title, term) == null) return false;
+        }
+        return any;
     }
 };
 
@@ -416,6 +426,25 @@ test "rutracker: the folded query matches Russian titles in either case" {
     // Latin text keeps its spaces and punctuation.
     var ascii: [32]u8 = undefined;
     try testing.expectEqualStrings("sferro & tommy", fold(&ascii, "Sferro & Tommy"));
+}
+
+test "rutracker: space-separated words match anywhere in the title" {
+    const a = testing.allocator;
+    var engine = Engine.init(a);
+    defer engine.deinit();
+
+    try engine.query.appendSlice(a, " паттерн   проект ");
+    var buf: [1024]u8 = undefined;
+
+    // Both words are parts of longer words, in either order.
+    try testing.expect(engine.matches("ПАТТЕРНЫ проектирования", "AABB", &buf));
+    try testing.expect(engine.matches("Проектирование на паттернах", "AABB", &buf));
+    // One missing word is enough to reject the record.
+    try testing.expect(!engine.matches("Паттерны без второго слова", "AABB", &buf));
+    // A single word stays a plain substring search.
+    engine.query.clearRetainingCapacity();
+    try engine.query.appendSlice(a, "ПАТТЕРНЫ");
+    try testing.expect(engine.matches("Паттерны проектирования", "AABB", &buf));
 }
 
 test "rutracker: the result builds the magnet the view mounts" {

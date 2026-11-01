@@ -715,7 +715,7 @@ pub const App = struct {
 
         var buf: [240]u8 = undefined;
         if (std.Io.Dir.cwd().statFile(self.io, path, .{})) |st| {
-            const text = std.fmt.bufPrint(&buf, "база: {s} · {d} ГБ · введите запрос и нажмите Enter", .{
+            const text = std.fmt.bufPrint(&buf, "база: {s} · {d} ГБ · введите слова через пробел и нажмите Enter", .{
                 std.fs.path.basename(path), st.size / (1 << 30),
             }) catch "";
             self.setStatus(text, .dim);
@@ -1498,7 +1498,7 @@ pub const App = struct {
         frame.put(if (self.db_results_focus) .dim else .accent, if (self.db_results_focus) " " else ">");
         frame.put(.plain, " ");
         frame.put(.plain, skipCols(self.db_query.items, offset));
-        if (self.db_query.items.len == 0) frame.put(.dim, "запрос по базе RuTracker · Enter — искать");
+        if (self.db_query.items.len == 0) frame.put(.dim, "запрос по базе RuTracker · слова через пробел · Enter — искать");
         frame.endRow();
 
         const scanned = self.db.scanned.load(.monotonic);
