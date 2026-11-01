@@ -1,7 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
 const build_options = @import("build_options");
-const c = @import("c");
 const procs = @import("procs.zig");
 const term = @import("term.zig");
 const tui = @import("tui.zig");
@@ -117,28 +116,52 @@ fn valueOf(rest: []const []const u8, index: *usize, arg: []const u8, name: []con
     return .no_match;
 }
 
-/// The librats version is read out of the linked library at runtime, not from a
-/// constant or from build.zig.zon: the archive vendored by
-/// `scripts/fetch-librats.sh` is the only thing that knows what it was built
-/// from, and a mismatch here means the vendor step was skipped or stale.
-pub fn libratsVersion() struct { major: c_int, minor: c_int, patch: c_int, build: c_int, text: [:0]const u8 } {
-    var major: c_int = 0;
-    var minor: c_int = 0;
-    var patch: c_int = 0;
-    var build: c_int = 0;
-    c.rats_version(&major, &minor, &patch, &build);
-    return .{
-        .major = major,
-        .minor = minor,
-        .patch = patch,
-        .build = build,
-        .text = std.mem.span(c.rats_version_string()),
-    };
+/// ziggurat links neither librats nor the C library: the mount engine is the
+/// only thing that speaks librats, so `rekarma --version` is where the engine's
+/// version comes from. A missing rekarma answers with empty strings instead of
+/// making `--help`/`--version` fail.
+fn versionsOf(
+    allocator: std.mem.Allocator,
+    io: Io,
+    exe: []const u8,
+    rekarma_buf: []u8,
+    librats_buf: []u8,
+) procs.ToolVersions {
+    return procs.toolVersions(allocator, io, exe, rekarma_buf, librats_buf);
 }
 
-fn printHelp(out: *Io.Writer) !void {
+/// The help and version flags run before a command line is applied, so they ask
+/// the default engine name on PATH, exactly what `run` would use with no flags.
+fn defaultVersions(
+    allocator: std.mem.Allocator,
+    io: Io,
+    path_var: ?[]const u8,
+    rekarma_buf: []u8,
+    librats_buf: []u8,
+) procs.ToolVersions {
+    const defaults: procs.Config = .{};
+    const found = procs.resolveExecutable(allocator, io, defaults.rekarma, path_var) catch return .{};
+    const exe = found orelse return .{};
+    return versionsOf(allocator, io, exe, rekarma_buf, librats_buf);
+}
+
+fn printHelp(out: *Io.Writer, versions: procs.ToolVersions) !void {
     try out.writeAll(usage);
-    try out.print("linked librats: {s}\n", .{libratsVersion().text});
+    if (versions.rekarma.len == 0) {
+        try out.writeAll("rekarma: не найден — поставьте его на PATH или укажите --rekarma <путь>\n");
+        return;
+    }
+    try out.print("rekarma {s} · librats {s}\n", .{ versions.rekarma, versions.librats });
+}
+
+fn printVersion(out: *Io.Writer, versions: procs.ToolVersions) !void {
+    if (versions.rekarma.len == 0) {
+        try out.print("ziggurat {s} (rekarma не найден)\n", .{build_options.version});
+        return;
+    }
+    try out.print("ziggurat {s} (rekarma {s}, librats {s})\n", .{
+        build_options.version, versions.rekarma, versions.librats,
+    });
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -158,9 +181,19 @@ fn run(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const out = &stdout_file_writer.interface;
 
+    const path_var = init.environ_map.get("PATH");
+    var rekarma_ver_buf: [64]u8 = undefined;
+    var librats_ver_buf: [64]u8 = undefined;
+
     switch (parse(args)) {
-        .help => try printHelp(out),
-        .version => try out.print("ziggurat {s} (librats {s})\n", .{ build_options.version, libratsVersion().text }),
+        .help => {
+            const versions = defaultVersions(arena, init.io, path_var, &rekarma_ver_buf, &librats_ver_buf);
+            try printHelp(out, versions);
+        },
+        .version => {
+            const versions = defaultVersions(arena, init.io, path_var, &rekarma_ver_buf, &librats_ver_buf);
+            try printVersion(out, versions);
+        },
         .problem => |arg| {
             try out.print("ziggurat: unknown option or missing value: {s}\n\n", .{arg});
             try out.writeAll(usage);
@@ -182,13 +215,20 @@ fn run(init: std.process.Init) !void {
             // Resolved once, here, where the environment is in reach: a
             // missing rekarma is a warning on the status line rather than a
             // spawn failure after the user has already pasted a magnet.
-            const path_var = init.environ_map.get("PATH");
             const rekarma_exe = try procs.resolveExecutable(arena, init.io, options.config.rekarma, path_var);
             const player_exe = try procs.resolveExecutable(arena, init.io, options.config.player, path_var);
 
+            // The engine answers for its own librats: ziggurat has no copy of
+            // the library to ask, and the version shown must be the one the
+            // mounts will actually run.
+            const versions = if (rekarma_exe) |exe|
+                versionsOf(arena, init.io, exe, &rekarma_ver_buf, &librats_ver_buf)
+            else
+                procs.ToolVersions{};
+
             var app = try tui.App.init(init.gpa, init.io, options.config, .{
                 .version = build_options.version,
-                .librats_version = libratsVersion().text,
+                .rekarma_version = versions.rekarma,
                 .history_path = options.history_path,
                 .rekarma_exe = rekarma_exe,
                 .player_exe = player_exe,
@@ -239,15 +279,4 @@ test "parse: what does not parse names the argument" {
     const missing = parse(&.{ "ziggurat", "--cache" });
     try std.testing.expect(missing == .problem);
     try std.testing.expectEqualStrings("--cache", missing.problem);
-}
-
-test "librats: the library reports the version it was built from" {
-    const v = libratsVersion();
-    try std.testing.expect(v.text.len > 0);
-    try std.testing.expect(v.major >= 0 and v.minor >= 0 and v.patch >= 0);
-    // The string form and the numeric form must agree, or one of them was
-    // generated from a different tag than the rest of the archive.
-    const expect = try std.fmt.allocPrint(std.testing.allocator, "{d}.{d}.{d}.{d}", .{ v.major, v.minor, v.patch, v.build });
-    defer std.testing.allocator.free(expect);
-    try std.testing.expectEqualStrings(expect, v.text);
 }

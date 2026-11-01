@@ -4,8 +4,8 @@ A two-panel terminal UI for watching releases without downloading them first.
 
 The left panel is a source line — a magnet link, a bare info-hash, or a
 `.torrent` file; the right one is the history of what you typed.
-Enter mounts the release as a read-only directory (through a FUSE 3 mount served
-by [rekarma](https://github.com/librats/librats) and librats' bittorrent stack),
+Enter mounts the release as a read-only directory (a FUSE 3 mount served by
+`rekarma`, which owns the librats bittorrent stack),
 Enter on a mounted row lists its media files, and Enter on a file starts `vlc` on
 it. The player's reads are what pull the pieces, so playback starts long before
 the release is complete: browsing a 100 GB release costs its metadata only.
@@ -20,15 +20,14 @@ the release is complete: browsing a 100 GB release costs its metadata only.
 
 ## Build and run
 
-    bash scripts/fetch-librats.sh   # once: vendors librats for three targets
     zig build                       # -> zig-out/bin/ziggurat (host)
     zig build dist                  # -> zig-out/<triple>/ziggurat (ReleaseSafe, stripped)
     zig build run                   # the interface
     zig build test                  # unit tests
 
-Requires Zig 0.17.0 (`build.zig.zon` `.minimum_zig_version`), and `cmake`,
-`make`, `curl`, `tar` for the librats build. No cross toolchain is needed:
-librats is compiled by `zig c++ -target <triple>`.
+Requires Zig 0.17.0 (`build.zig.zon` `.minimum_zig_version`). Ziggurat is pure
+Zig and links neither librats nor the C library; nothing has to be vendored
+before the first build.
 
 Watching a release needs two more programs on `PATH` (both overridable):
 
@@ -38,8 +37,9 @@ Watching a release needs two more programs on `PATH` (both overridable):
   That binary needs libfuse3 at build and run time.
 - `vlc` — the player, started as `vlc <path-inside-the-mount>`.
 
-`--help` prints the librats version the linked archive reports, which is how the
-build proves it is linked against the pin in `scripts/fetch-librats.sh`.
+`--help` and `--version` ask rekarma for its own and librats' versions
+(`rekarma --version`); ziggurat has no librats of its own to report, and the
+answer therefore describes the engine the mounts will actually run.
 
 ## Keys
 

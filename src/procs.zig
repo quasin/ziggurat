@@ -174,6 +174,54 @@ pub fn installAutonomi(io: Io, dir: []const u8, log_path: []const u8) !std.posix
     return child.id orelse error.NoPid;
 }
 
+pub const ToolVersions = struct {
+    rekarma: []const u8 = "",
+    librats: []const u8 = "",
+};
+
+/// The version lines say `rekarma 0.0.1` / `librats 3.0.4.0 (major=…)`;
+/// everything after the first word is trimmed to the bare version token.
+pub fn parseToolVersions(output: []const u8, rekarma_buf: []u8, librats_buf: []u8) ToolVersions {
+    var versions: ToolVersions = .{};
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "rekarma ") and versions.rekarma.len == 0) {
+            versions.rekarma = copyVersion(rekarma_buf, trimmed["rekarma ".len..]);
+        } else if (std.mem.startsWith(u8, trimmed, "librats ") and versions.librats.len == 0) {
+            versions.librats = copyVersion(librats_buf, trimmed["librats ".len..]);
+        }
+    }
+    return versions;
+}
+
+fn copyVersion(buf: []u8, tail: []const u8) []const u8 {
+    const end = std.mem.indexOfAny(u8, tail, " \t") orelse tail.len;
+    const n = @min(buf.len, end);
+    @memcpy(buf[0..n], tail[0..n]);
+    return buf[0..n];
+}
+
+/// ziggurat does not link librats any more: the binary that mounts releases is
+/// the one that speaks it, so its own `--version` is the only truthful answer
+/// about the engine. A missing or failing rekarma yields empty strings.
+pub fn toolVersions(
+    allocator: std.mem.Allocator,
+    io: Io,
+    exe: []const u8,
+    rekarma_buf: []u8,
+    librats_buf: []u8,
+) ToolVersions {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ exe, "--version" },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(4 * 1024),
+    }) catch return .{};
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return parseToolVersions(result.stdout, rekarma_buf, librats_buf);
+}
+
 pub const MediaFile = struct {
     path: []const u8,
     size: u64,
@@ -294,4 +342,22 @@ test "procs: the installer command carries the upstream script and the log" {
     try testing.expect(std.mem.indexOf(u8, cmd, "https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "| bash") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, ".ziggurat/autonomi-install.log") != null);
+}
+
+test "procs: rekarma's version output is split into the two engines" {
+    var rekarma_buf: [64]u8 = undefined;
+    var librats_buf: [64]u8 = undefined;
+    const versions = parseToolVersions(
+        \\rekarma 0.0.1
+        \\librats 3.0.4.0 (major=3 minor=0 patch=4 build=0)
+        \\librats abi 0x030004, git 3.0.4
+        \\
+    , &rekarma_buf, &librats_buf);
+    try testing.expectEqualStrings("0.0.1", versions.rekarma);
+    try testing.expectEqualStrings("3.0.4.0", versions.librats);
+
+    // No rekarma on the machine is an empty answer, not a crash.
+    const none = parseToolVersions("command not found\n", &rekarma_buf, &librats_buf);
+    try testing.expectEqualStrings("", none.rekarma);
+    try testing.expectEqualStrings("", none.librats);
 }

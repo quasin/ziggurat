@@ -66,7 +66,9 @@ const View = enum { history, files };
 
 pub const Options = struct {
     version: []const u8,
-    librats_version: []const u8,
+    /// The engine's own version, read from `rekarma --version` at startup:
+    /// ziggurat links no librats of its own to ask.
+    rekarma_version: []const u8,
     history_path: []const u8,
     /// Where `--rekarma` / `--vlc` resolved to, or null when the program is not
     /// on PATH. Resolved once at startup so a missing program is a message, not
@@ -691,9 +693,12 @@ pub const App = struct {
         frame.endRow();
 
         var buf: [128]u8 = undefined;
-        const right = std.fmt.bufPrint(&buf, "librats {s} · ziggurat {s} ", .{
-            self.options.librats_version, self.options.version,
-        }) catch return;
+        const right = if (self.options.rekarma_version.len > 0)
+            std.fmt.bufPrint(&buf, "rekarma {s} · ziggurat {s} ", .{
+                self.options.rekarma_version, self.options.version,
+            }) catch return
+        else
+            std.fmt.bufPrint(&buf, "ziggurat {s} ", .{self.options.version}) catch return;
         const width = term.displayWidth(right);
         const used = 10 + term.displayWidth("p2p-релизы: magnet/.torrent → монтирование → vlc");
         if (size.cols > used + width) {
