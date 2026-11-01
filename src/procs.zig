@@ -162,6 +162,75 @@ pub fn startRecorder(io: Io, exe: []const u8) !void {
     if (term != .exited or term.exited != 0) return error.RecorderStartFailed;
 }
 
+/// Publishes one message into the default room with `rekarma <text>`: a one-shot
+/// send that waits for a peer, hands the bytes to the engine and exits. It runs
+/// behind the screen because that wait is seconds long, and it is spawned with
+/// argv rather than a shell so the message's quotes and spaces stay literal.
+///
+/// `port` is the recorder's listening port on this machine: dialing it directly
+/// makes the message reach the room even when mDNS and the DHT cannot route
+/// between two nodes that share a host but not a network path.
+pub fn publishMessage(io: Io, exe: []const u8, text: []const u8, port: ?u16) !std.posix.pid_t {
+    var argv_buf: [4][]const u8 = undefined;
+    var peer_buf: [24]u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = exe;
+    argc += 1;
+    if (port) |p| {
+        const peer = std.fmt.bufPrint(&peer_buf, "127.0.0.1:{d}", .{p}) catch return error.NoPid;
+        argv_buf[argc] = "-c";
+        argv_buf[argc + 1] = peer;
+        argc += 2;
+    }
+    argv_buf[argc] = text;
+    argc += 1;
+
+    const child = try std.process.spawn(io, .{
+        .argv = argv_buf[0..argc],
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    return child.id orelse error.NoPid;
+}
+
+/// The port the recorder listens on, read from the banner it printed at startup
+/// (`node <id> on port <n>`). The log is appended to by every run, so the last
+/// banner is the one the running process wrote; a log without one means there is
+/// no recorder to dial.
+pub fn recorderPort(allocator: std.mem.Allocator, io: Io) ?u16 {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, room_log_file, allocator, .limited(1 << 20)) catch return null;
+    defer allocator.free(data);
+    return portFromLog(data);
+}
+
+/// The `on port N` half of `recorderPort`, split out so the parse is testable
+/// without a daemon.
+fn portFromLog(text: []const u8) ?u16 {
+    const marker = " on port ";
+    var port: ?u16 = null;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const at = std.mem.indexOf(u8, line, marker) orelse continue;
+        const digits = std.mem.trim(u8, line[at + marker.len ..], " \t\r");
+        port = std.fmt.parseInt(u16, digits, 10) catch port;
+    }
+    return port;
+}
+
+/// The exit code of a child that has finished, or null while it still runs.
+/// `reapIfDone` answers the same question with a bool, which is enough to drop
+/// a pid but says nothing about whether the job worked.
+pub fn reapCode(pid: std.posix.pid_t) ?u32 {
+    var status: i32 = 0;
+    if (linux.waitpid(pid, &status, linux.W.NOHANG) != pid) return null;
+    // WIFEXITED / WEXITSTATUS without libc: a signal death leaves the low 7 bits
+    // set, and 0xff is a code no clean run produces.
+    if ((status & 0x7f) != 0) return 0xff;
+    return @intCast((status >> 8) & 0xff);
+}
+
 /// Hands a file inside the mount to the player. The path stays inside the
 /// FUSE mount, so the player's reads are what pull the pieces: nothing is
 /// downloaded until the playhead gets there.
@@ -369,6 +438,21 @@ pub fn cacheLogPath(allocator: std.mem.Allocator, cache_dir: []const u8) ![]u8 {
 }
 
 const testing = std.testing;
+
+test "procs: the recorder's port is the last one its log printed" {
+    const log =
+        \\daemon   pid 100, log all.txt.log
+        \\node     082194d4f537 on port 40001
+        \\listening in rekarma — Ctrl-C to stop
+        \\daemon   pid 200, log all.txt.log
+        \\node     082194d4f537 on port 40585
+        \\listening in rekarma — Ctrl-C to stop
+    ;
+    try testing.expectEqual(@as(?u16, 40585), portFromLog(log));
+    try testing.expectEqual(@as(?u16, null), portFromLog("listening in rekarma\n"));
+    // A torn last line (the daemon died mid-write) keeps the previous answer.
+    try testing.expectEqual(@as(?u16, 40001), portFromLog("node id on port 40001\nnode id on port "));
+}
 
 test "procs: one release, one mount dir and one cache dir" {
     const a = testing.allocator;

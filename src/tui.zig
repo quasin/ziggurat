@@ -62,7 +62,10 @@ const Runtime = struct {
 };
 
 const Focus = enum { input, history };
-const View = enum { history, files };
+/// What the right panel shows: the mount history, a release's files, or the
+/// reKarma room. The room is a view rather than a popup because reading it and
+/// typing into it are the same act.
+const View = enum { history, files, room };
 
 /// The shortcuts under the source line: fixed one-shot jobs, each with its own
 /// log, not history entries. `↓` walks them, Enter runs the selected one. The
@@ -83,6 +86,16 @@ const links = [_]Link{
 /// its file at 1000 lines; the panel shows the tail of that, and keeping more
 /// than it can ever print only makes a reload more expensive.
 const room_max_lines: usize = 200;
+
+/// How long a message waits for the recorder to print its listening port before
+/// it is published through discovery instead. The daemon fork is instant but the
+/// node's banner comes after librats bootstraps.
+const recorder_wait_ticks = 8 * 1000 / tick_ms;
+
+/// The longest message the compose line accepts. rekarma prepends a stamp and a
+/// peer id to every line it keeps, so a room message that never fits a terminal
+/// row is a mistake rather than a feature.
+const compose_max: usize = 400;
 
 pub const Options = struct {
     version: []const u8,
@@ -127,13 +140,9 @@ pub const App = struct {
     files_entry: usize = 0,
     files_scroll: usize = 0,
 
-    /// The default room's history: rekarma's `all.txt`, read into memory when the
-    /// file changes and shown under the links while `room_shown`. The lines live
-    /// in the app's allocator because they outlive a frame; the panel only ever
-    /// prints slices of them.
-    room_shown: bool = false,
-    /// Whether this session started the recorder (as opposed to finding one
-    /// already running). Only that one is reported on the way out.
+    /// The room view's messages: rekarma's `all.txt`, read into memory when the
+    /// file changes. The lines live in the app's allocator because they outlive a
+    /// frame; the panel only ever prints slices of them.
     room_started: bool = false,
     room_lines: std.ArrayList([]u8),
     room_absent: bool = false,
@@ -142,6 +151,26 @@ pub const App = struct {
     room_read: bool = false,
     room_size: u64 = 0,
     room_mtime: i96 = 0,
+    /// Messages above the tail the user scrolled to; 0 follows whatever arrives.
+    room_scroll: usize = 0,
+    /// How many message rows the last frame had room for, so scroll keys clamp
+    /// against the same number the screen used.
+    room_rows: usize = 0,
+    /// The line being written into the room, kept apart from the source line so a
+    /// half-typed magnet link is not lost when the room is opened.
+    compose: std.ArrayList(u8),
+    compose_cursor: usize = 0,
+    /// The one-shot `rekarma <message>` that publishes the compose line; reaped
+    /// like the other long-lived children because finding a peer takes seconds.
+    publish_pid: ?std.posix.pid_t = null,
+    published: [160]u8 = @splat(0),
+    published_len: usize = 0,
+    /// A message handed over but not yet spawned: the recorder prints the port it
+    /// listens on a moment after it forks, and a send without that port falls
+    /// back to the DHT and takes a minute to reach anybody.
+    pending: [compose_max]u8 = @splat(0),
+    pending_len: usize = 0,
+    pending_since: u64 = 0,
 
     status_buf: [240]u8 = @splat(0),
     status_len: usize = 0,
@@ -166,6 +195,7 @@ pub const App = struct {
             .files = .empty,
             .files_arena = std.heap.ArenaAllocator.init(allocator),
             .room_lines = .empty,
+            .compose = .empty,
             .players = .empty,
         };
         try app.list.load(io, options.history_path);
@@ -199,6 +229,7 @@ pub const App = struct {
         self.files_arena.deinit();
         self.clearRoom();
         self.room_lines.deinit(self.allocator);
+        self.compose.deinit(self.allocator);
         self.players.deinit(self.allocator);
     }
 
@@ -244,6 +275,7 @@ pub const App = struct {
 
         switch (self.view) {
             .files => try self.handleFiles(key),
+            .room => try self.handleRoom(key),
             .history => switch (self.focus) {
                 .input => try self.handleInput(key),
                 .history => {
@@ -252,6 +284,112 @@ pub const App = struct {
             },
         }
         return false;
+    }
+
+    /// Keys in the room view: the panel is a chat, so a printable key edits the
+    /// message line, Enter publishes it, and the arrows scroll the log instead of
+    /// walking a selection. Esc is the way back to the mount history.
+    fn handleRoom(self: *App, key: term.Key) !void {
+        switch (key) {
+            .esc, .tab => {
+                self.view = .history;
+                self.focus = .input;
+                self.room_scroll = 0;
+            },
+            .up => self.room_scroll +|= 1,
+            .down => if (self.room_scroll > 0) {
+                self.room_scroll -= 1;
+            },
+            .enter => try self.sendMessage(),
+            .home => self.room_scroll = room_max_lines,
+            .end => self.room_scroll = 0,
+            .text => |bytes| {
+                if (self.compose.items.len + bytes.len > compose_max) {
+                    self.setStatus("сообщение длиннее 400 символов — не вставляю", .warn);
+                    return;
+                }
+                try self.compose.insertSlice(self.allocator, self.compose_cursor, bytes);
+                self.compose_cursor += bytes.len;
+            },
+            .backspace => if (self.compose_cursor > 0) {
+                const start = prevCodepoint(self.compose.items, self.compose_cursor);
+                try self.compose.replaceRange(self.allocator, start, self.compose_cursor - start, "");
+                self.compose_cursor = start;
+            },
+            .delete => if (self.compose_cursor < self.compose.items.len) {
+                const end = nextCodepoint(self.compose.items, self.compose_cursor);
+                try self.compose.replaceRange(self.allocator, self.compose_cursor, end - self.compose_cursor, "");
+            },
+            .left => self.compose_cursor = prevCodepoint(self.compose.items, self.compose_cursor),
+            .right => self.compose_cursor = nextCodepoint(self.compose.items, self.compose_cursor),
+            else => {},
+        }
+    }
+
+    /// Publishes the typed line with `rekarma <text>`: a one-shot send into the
+    /// same room the recorder is in. The text is parked in `pending` and the tick
+    /// spawns it once the recorder's listening port is known — finding a peer
+    /// takes seconds, so the child runs behind the screen.
+    fn sendMessage(self: *App) !void {
+        const text = std.mem.trim(u8, self.compose.items, " \t");
+        if (text.len == 0) {
+            self.setStatus("пустая строка не отправляется", .warn);
+            return;
+        }
+        if (self.options.rekarma_exe == null) {
+            self.setStatus("rekarma не найден в PATH — укажите --rekarma <путь>", .err);
+            return;
+        }
+        if (self.publish_pid != null or self.pending_len > 0) {
+            self.setStatus("предыдущее сообщение ещё отправляется", .warn);
+            return;
+        }
+
+        const n = @min(text.len, self.pending.len);
+        @memcpy(self.pending[0..n], text[0..n]);
+        self.pending_len = n;
+        self.pending_since = self.tick;
+
+        self.compose.clearRetainingCapacity();
+        self.compose_cursor = 0;
+        self.room_scroll = 0;
+
+        var buf: [240]u8 = undefined;
+        const note = std.fmt.bufPrint(&buf, "отправляю в комнату reKarma: {s}", .{text}) catch "";
+        self.setStatus(note, .dim);
+    }
+
+    /// The spawn half of `sendMessage`, called from the tick: with the recorder's
+    /// port the message is dialed straight into the room instead of waiting for
+    /// discovery, and after a few seconds without one it goes out anyway.
+    fn publishPending(self: *App) void {
+        if (self.pending_len == 0 or self.publish_pid != null) return;
+
+        const port = if (procs.recorderRunning(self.io))
+            procs.recorderPort(self.allocator, self.io)
+        else
+            null;
+        const waited = self.tick - self.pending_since;
+        if (port == null and waited < recorder_wait_ticks) return;
+
+        const text = self.pending[0..self.pending_len];
+        const exe = self.options.rekarma_exe orelse {
+            self.pending_len = 0;
+            self.setStatus("rekarma не найден в PATH — укажите --rekarma <путь>", .err);
+            return;
+        };
+        self.publish_pid = procs.publishMessage(self.io, exe, text, port) catch |err| {
+            self.pending_len = 0;
+            var buf: [200]u8 = undefined;
+            const note = std.fmt.bufPrint(&buf, "отправка в комнату: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(note, .err);
+            return;
+        };
+
+        const n = @min(text.len, self.published.len);
+        @memcpy(self.published[0..n], text[0..n]);
+        self.published_len = n;
+        self.pending_len = 0;
     }
 
     fn handleInput(self: *App, key: term.Key) !void {
@@ -450,22 +588,16 @@ pub const App = struct {
         switch (links[self.link_index].action) {
             .autonomi_install => try self.installAutonomi(),
             .rutracker_database => try self.downloadRutrackerDatabase(),
-            .room_history => try self.toggleRoomHistory(),
+            .room_history => try self.openRoom(),
         }
     }
 
-    /// Enter on the room shortcut: the default room's history appears under the
-    /// links and refreshes with every message, and a recorder is started when
-    /// none is running — without one the file never grows and the panel would
-    /// look broken. The recorder is a daemon of its own: like a mount it outlives
-    /// the interface, so Enter again only hides the panel.
-    fn toggleRoomHistory(self: *App) !void {
-        if (self.room_shown) {
-            self.room_shown = false;
-            self.link_selected = false;
-            self.setStatus("история комнаты reKarma скрыта — запись продолжается", .dim);
-            return;
-        }
+    /// Enter on the room shortcut: the right panel turns into the room, and a
+    /// recorder is started when none is running — without one the file never
+    /// grows, sending has nowhere to go and the view would look broken. The
+    /// recorder is a daemon of its own and, like a mount, outlives the interface.
+    fn openRoom(self: *App) !void {
+        self.link_selected = false;
 
         const started = !procs.recorderRunning(self.io);
         if (started) {
@@ -482,10 +614,11 @@ pub const App = struct {
             self.room_started = true;
         }
 
-        self.room_shown = true;
-        // The link stays selected so the same key closes what it opened; any
-        // other key falls back to typing by itself.
-        self.link_selected = true;
+        self.view = .room;
+        // The room owns the keys while it is open, so the cursor leaves the
+        // source line: everything typed goes into the message line instead.
+        self.focus = .history;
+        self.room_scroll = 0;
         self.room_read = false;
         self.refreshRoom();
 
@@ -729,9 +862,31 @@ pub const App = struct {
         for (self.players.items) |pid| procs.reap(pid);
         self.players.clearRetainingCapacity();
 
-        // The room panel is a tail: it has to follow the file while it is open,
+        // The room view is a tail: it has to follow the file while it is open,
         // and costs one stat when nothing arrived.
-        if (self.room_shown) self.refreshRoom();
+        if (self.view == .room) self.refreshRoom();
+
+        // A message waiting for the recorder's port is spawned here, out of the
+        // key handler: the wait is bounded in ticks, not in blocking calls.
+        if (self.pending_len > 0) self.publishPending();
+
+        // The publish is a one-shot `rekarma <message>`, so its exit is the
+        // answer: code 0 means the room has it.
+        if (self.publish_pid) |pid| {
+            if (procs.reapCode(pid)) |code| {
+                self.publish_pid = null;
+                var buf: [240]u8 = undefined;
+                if (code == 0) {
+                    const text = std.fmt.bufPrint(&buf, "опубликовано в комнате reKarma: {s}", .{
+                        self.published[0..self.published_len],
+                    }) catch "";
+                    self.setStatus(text, .ok);
+                } else {
+                    const text = std.fmt.bufPrint(&buf, "rekarma не смогла опубликовать (код {d})", .{code}) catch "";
+                    self.setStatus(text, .err);
+                }
+            }
+        }
 
         // The installer is long-running, so keep its pid until it actually
         // exits: dropping it on the first poll would leave a zombie behind.
@@ -869,9 +1024,11 @@ pub const App = struct {
         // Interiors first, boxes last: a panel's content erases to the end of
         // its line, and drawing the borders afterwards keeps them intact.
         const cursor_at = self.drawInputPanel(&frame, top, 1, height, left_width);
+        var room_cursor: ?[2]u16 = null;
         switch (self.view) {
             .history => self.drawHistoryPanel(&frame, top, right_left, height, right_width),
             .files => self.drawFilesPanel(&frame, top, right_left, height, right_width),
+            .room => room_cursor = self.drawRoomPanel(&frame, top, right_left, height, right_width),
         }
         frame.at(top, size.cols);
         frame.endRow();
@@ -882,13 +1039,16 @@ pub const App = struct {
         drawBox(&frame, top, right_left, height, right_width, switch (self.view) {
             .history => "История",
             .files => "Файлы релиза",
+            .room => "Комната reKarma",
         });
 
         self.drawFooter(&frame, size);
 
         // The cursor is only shown where typing goes; everywhere else the
-        // selection highlight is the pointer.
-        if (cursor_at) |pos| {
+        // selection highlight is the pointer. In the room that is the compose
+        // line, not the source line.
+        const typing_at = if (self.view == .room) room_cursor else cursor_at;
+        if (typing_at) |pos| {
             frame.at(pos[0], pos[1]);
             frame.showCursor();
         } else {
@@ -1003,11 +1163,7 @@ pub const App = struct {
             }
         }
 
-        if (self.room_shown) {
-            // The room's history takes every row the hints would use: it is the
-            // one thing in this panel that grows on its own.
-            self.drawRoom(frame, row, top + height - 1, left, width);
-        } else if (row + 2 < top + height - 1) {
+        if (row + 2 < top + height - 1) {
             frame.at(row + 1, left + 1);
             frame.put(.dim, "Enter — выполнить · ↑↓ — ссылки");
             frame.at(row + 2, left + 1);
@@ -1019,41 +1175,50 @@ pub const App = struct {
         return .{ top + 1, @min(cursor_col, left + width - 2) };
     }
 
-    /// The default room's last messages, newest at the bottom: the panel is a
-    /// tail, so whatever arrived last is what the eye lands on.
-    fn drawRoom(self: *App, frame: *term.Frame, first: u16, border_bottom: u16, left: u16, width: u16) void {
-        if (border_bottom < first + 2) return;
-        const last = border_bottom - 1;
-        const text_width: u16 = width -| 4;
+    /// The room, right panel: the newest messages filling the height and a compose
+    /// line on the last row, so reading what arrived and answering it are one
+    /// screen. Returns where the typing cursor belongs.
+    fn drawRoomPanel(self: *App, frame: *term.Frame, top: u16, left: u16, height: u16, width: u16) ?[2]u16 {
+        const inner_width: u16 = width -| 2;
+        const text_width: u16 = inner_width -| 2;
 
-        var head_buf: [96]u8 = undefined;
+        var head_buf: [128]u8 = undefined;
         const head = if (self.room_absent)
             std.fmt.bufPrint(&head_buf, "комната reKarma · {s} нет", .{procs.room_file}) catch ""
         else
-            std.fmt.bufPrint(&head_buf, "комната reKarma · {d} сообщ.", .{self.room_lines.items.len}) catch "";
-        frame.at(first, left + 1);
-        frame.put(.accent, truncateTo(head, text_width));
+            std.fmt.bufPrint(&head_buf, "комната reKarma · {d} сообщ. · ↑↓ — прокрутка · Home/End", .{
+                self.room_lines.items.len,
+            }) catch "";
+        frame.at(top + 1, left + 2);
+        frame.put(.dim, truncateTo(head, inner_width -| 1));
         frame.endRow();
 
-        if (self.room_lines.items.len == 0) {
-            frame.at(first + 1, left + 1);
+        // The compose line owns the row above the bottom border; the messages get
+        // everything between the header and it.
+        const compose_row = top + height - 2;
+        const rows: usize = if (compose_row > top + 2) compose_row - (top + 2) else 0;
+        self.room_rows = rows;
+
+        const total = self.room_lines.items.len;
+        if (self.room_scroll > total -| rows) self.room_scroll = total -| rows;
+        const end = total - self.room_scroll;
+        const start = end -| rows;
+
+        if (total == 0) {
+            frame.at(top + 2, left + 2);
             frame.put(.dim, truncateTo(
                 if (self.room_absent) "лог появится с первым сообщением" else "пока никто ничего не написал",
-                text_width,
+                inner_width -| 1,
             ));
             frame.endRow();
-            return;
         }
 
-        const rows = last - first;
-        const start = self.room_lines.items.len -| rows;
         var i: usize = 0;
-        while (i < rows) : (i += 1) {
-            const index = start + i;
-            if (index >= self.room_lines.items.len) break;
-            const row = first + 1 + @as(u16, @intCast(i));
+        while (i < rows and start + i < end) : (i += 1) {
+            const row = top + 2 + @as(u16, @intCast(i));
+            if (row >= compose_row) break;
 
-            const line = parseRoomLine(self.room_lines.items[index]);
+            const line = parseRoomLine(self.room_lines.items[start + i]);
             frame.at(row, left + 1);
             frame.put(.dim, " ");
             var used: u16 = 2;
@@ -1065,6 +1230,21 @@ pub const App = struct {
             frame.put(.plain, truncateTo(line.text, text_width -| used));
             frame.endRow();
         }
+
+        // What the user is about to say: the same scrolling the source line does,
+        // so a long message keeps the caret visible in a narrow panel.
+        const compose_width: u16 = inner_width -| 4;
+        const cursor_cols = term.displayWidth(self.compose.items[0..self.compose_cursor]);
+        const offset = if (cursor_cols >= compose_width) cursor_cols - compose_width + 1 else 0;
+        frame.at(compose_row, left + 1);
+        frame.put(.accent, ">");
+        frame.put(.plain, " ");
+        frame.put(.plain, skipCols(self.compose.items, offset));
+        if (self.compose.items.len == 0) frame.put(.dim, "сообщение в комнату · Enter — отправить");
+        frame.endRow();
+
+        const cursor_col = left + 3 + (cursor_cols - offset);
+        return .{ compose_row, @min(cursor_col, left + width - 2) };
     }
 
     fn drawHistoryPanel(self: *App, frame: *term.Frame, top: u16, left: u16, height: u16, width: u16) void {
@@ -1161,6 +1341,7 @@ pub const App = struct {
                 .history => "↑↓ — выбор · Enter — открыть · u — отмонтировать · x — удалить · q — выход",
             },
             .files => "↑↓ — файл · Enter — vlc · Esc — назад · Ctrl-C — выход",
+            .room => "Enter — отправить · ↑↓ — прокрутка · Home/End · Esc — назад · Ctrl-C — выход",
         };
         frame.put(.dim, hints);
         frame.endRow();

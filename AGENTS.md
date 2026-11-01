@@ -73,13 +73,23 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
 
 ## Pitfalls
 
-- **The room panel tails `all.txt` in the startup directory, not a file of its
+- **The room view tails `all.txt` in the startup directory, not a file of its
   own.** Plain `rekarma` records the room `rekarma` into `all.txt` (pid
   `all.txt.pid`, log `all.txt.log`) beside where it runs, and ziggurat only reads
   that file — putting the history in a ziggurat-owned path would show an empty
   panel next to a recorder writing elsewhere. The link starts `rekarma --daemon`
   itself when `all.txt.pid` names no live process, and the file is re-read only
   when its size or mtime changes: one stat per tick, never a read per frame.
+- **Two rekarma nodes on one host do not meet over discovery, so a sent message
+  needs the recorder's port.** A one-shot `rekarma <text>` that waits for mDNS or
+  the DHT never finds the recorder beside it (the log fills with
+  `no route to …`/`Network is unreachable`), so the panel's Enter dials
+  `-c 127.0.0.1:<port>` instead. That port is only printed in the daemon's banner
+  (`node <id> on port <n>`) a moment *after* it forks, which is why the send is
+  parked in a fixed buffer and spawned from the tick once the port is readable —
+  a send with no port silently costs the engine's 90 s peer wait. Parse the log's
+  **last** banner: it is appended across runs and the previous run's port is
+  stale.
 - **A module whose `test` blocks matter must be named from a `test` block.** A
   file reached only through `main()` is not analyzed in a test build, and its
   tests drop out of the artifact silently (`tui.zig`, `term.zig` did until

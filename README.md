@@ -73,13 +73,20 @@ minutes, with the last line of the daemon's log as the reason.
 
 ## The room shortcut
 
-The third shortcut under the source line, `История reKarma`, opens the default
-rekarma room in the left panel: the last messages rekarma recorded, refreshed as
-they arrive. Nothing in ziggurat links librats, so the panel tails the file plain
-`rekarma` writes itself — `all.txt` in the directory ziggurat was started from —
-and starts `rekarma --daemon` when no recorder is running (`all.txt.pid` is how
-it tells). The recorder outlives the interface like a mount; Enter again hides
-the panel, `kill $(cat all.txt.pid)` stops the recording.
+The third shortcut under the source line, `История reKarma`, turns the right
+panel into the default rekarma room: the messages rekarma recorded, newest at
+the bottom and refreshed as they arrive, with a message line on the last row.
+Typing there and pressing Enter publishes the text into the room; ↑↓ scroll the
+log, Home/End jump, Esc goes back to the mount history.
+
+Nothing in ziggurat links librats, so the panel tails the file plain `rekarma`
+writes itself — `all.txt` in the directory ziggurat was started from — and starts
+`rekarma --daemon` when no recorder is running (`all.txt.pid` is how it tells).
+Sending is a one-shot `rekarma <text>`; it is dialed at the recorder's own port,
+read from the banner in `all.txt.log` (`node … on port N`), so a message from the
+same machine reaches the room even when mDNS and the DHT cannot route between
+two nodes on one host. The recorder outlives the interface like a mount;
+`kill $(cat all.txt.pid)` stops the recording.
 
 ## License
 
