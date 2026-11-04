@@ -193,7 +193,8 @@ pub const App = struct {
     db_results_focus: bool = false,
     db_selected: usize = 0,
     db_scroll: usize = 0,
-    /// How many result rows the last frame had room for.
+    /// How many result *releases* the last frame had room for: each one is two
+    /// rows, the section and the title.
     db_rows: usize = 0,
     /// Set once the scan's outcome has been put on the status line, so it is
     /// not rewritten every tick.
@@ -1584,35 +1585,51 @@ pub const App = struct {
         frame.put(.dim, truncateTo(head, inner_width -| 1));
         frame.endRow();
 
-        // Rows of results, the query and the progress line taking the rest.
+        // Every release takes two rows — the section with its size, then the
+        // title — so the query and the progress line leave half as many
+        // releases on screen. Scrolling counts releases, not rows.
         const rows: usize = if (height > 4) height - 4 else 0;
-        self.db_rows = rows;
+        const recs: usize = rows / 2;
+        self.db_rows = recs;
         if (self.db_selected < self.db_scroll) self.db_scroll = self.db_selected;
-        if (rows > 0 and self.db_selected >= self.db_scroll + rows) {
-            self.db_scroll = self.db_selected - rows + 1;
+        if (recs > 0 and self.db_selected >= self.db_scroll + recs) {
+            self.db_scroll = self.db_selected - recs + 1;
         }
 
         if (self.db.mutex.tryLock()) {
             defer self.db.mutex.unlock();
             const items = self.db.results.items;
             var i: usize = 0;
-            while (i < rows and self.db_scroll + i < items.len) : (i += 1) {
+            while (i < recs and self.db_scroll + i < items.len) : (i += 1) {
                 const index = self.db_scroll + i;
                 const result = &items[index];
                 const selected = self.db_results_focus and index == self.db_selected;
-                const row = top + 3 + @as(u16, @intCast(i));
+                const row = top + 3 + @as(u16, @intCast(i * 2));
 
                 var size_buf: [24]u8 = undefined;
                 const size = sizeText(&size_buf, result.size);
-                const room_i: i32 = @as(i32, inner_width) - @as(i32, term.displayWidth(size)) - 6;
+                const size_width = term.displayWidth(size);
+                const forum_text = result.forumText();
+                const forum = if (forum_text.len > 0) forum_text else "раздел не указан";
+                // Two columns go to the selection marker, two to the gap the
+                // size leaves on the right.
+                const room_i: i32 = @as(i32, inner_width) - @as(i32, size_width) - 5;
                 const room: u16 = @intCast(@max(room_i, 4));
+                const shown = truncateTo(forum, room);
 
+                // The section on the left, the size against the right edge, so
+                // sizes line up down the panel whatever the section's length.
                 frame.at(row, left + 1);
                 frame.put(if (selected) .selected else .dim, if (selected) "▸" else " ");
-                frame.put(if (selected) .selected else .plain, " ");
-                frame.put(if (selected) .selected else .plain, truncateTo(result.title, room));
-                frame.put(if (selected) .selected else .dim, "  ");
+                frame.put(if (selected) .selected else .accent, " ");
+                frame.put(if (selected) .selected else .accent, shown);
+                const used = term.displayWidth(shown) + size_width;
+                frame.spaces(if (inner_width > used + 4) inner_width - used - 4 else 1);
                 frame.put(if (selected) .selected else .dim, size);
+                frame.endRow();
+
+                frame.at(row + 1, left + 3);
+                frame.put(if (selected) .selected else .plain, truncateTo(result.title, inner_width -| 2));
                 frame.endRow();
             }
         } else {

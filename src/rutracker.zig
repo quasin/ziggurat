@@ -39,15 +39,26 @@ const max_record: usize = 16 << 20;
 /// page cache and keeps the cancel latency small.
 const chunk_size: usize = 1 << 20;
 
+/// The section of the dump a release lives in, kept inside the result: the row
+/// prints it, and a second heap allocation per match is what makes a 300-hit
+/// scan cost 600 frees. Long forum names are clipped anyway.
+pub const max_forum: usize = 96;
+
 pub const Result = struct {
     title: []u8,
     hash: [64]u8 = undefined,
     hash_len: u8 = 0,
+    forum: [max_forum]u8 = undefined,
+    forum_len: u8 = 0,
     tracker_id: u32 = 1,
     size: u64 = 0,
 
     pub fn hashText(self: *const Result) []const u8 {
         return self.hash[0..self.hash_len];
+    }
+
+    pub fn forumText(self: *const Result) []const u8 {
+        return self.forum[0..self.forum_len];
     }
 
     /// The magnet link the row stands for: the info-hash and the tracker the
@@ -248,6 +259,8 @@ pub const Engine = struct {
         const hash_len = @min(parsed.hash.len, result.hash.len);
         @memcpy(result.hash[0..hash_len], parsed.hash[0..hash_len]);
         result.hash_len = @intCast(hash_len);
+        const forum = storeClipped(&result.forum, parsed.forum);
+        result.forum_len = @intCast(forum.len);
 
         self.lock();
         defer self.mutex.unlock();
@@ -293,6 +306,7 @@ fn recordEnd(buf: []const u8, from: usize) ?usize {
 pub const Parsed = struct {
     title: []const u8,
     hash: []const u8,
+    forum: []const u8 = "",
     tracker_id: u32 = 1,
     size: u64 = 0,
 };
@@ -324,7 +338,35 @@ pub fn parseRecord(block: []const u8) ?Parsed {
     else
         1;
 
-    return .{ .title = title, .hash = hash, .tracker_id = tracker_id, .size = size };
+    // The section is printed above the title, so a record without one is still
+    // a result: it just shows an empty first line.
+    const forum = forumText(block) orelse "";
+
+    return .{ .title = title, .hash = hash, .forum = forum, .tracker_id = tracker_id, .size = size };
+}
+
+/// The text of `<forum id="…">…</forum>`: the section of the dump the release
+/// sits in. Null when the record has none, which is not a parse failure.
+fn forumText(block: []const u8) ?[]const u8 {
+    const open_at = std.mem.indexOf(u8, block, "<forum ") orelse return null;
+    const open_end = std.mem.indexOfScalarPos(u8, block, open_at, '>') orelse return null;
+    const close_at = std.mem.indexOfPos(u8, block, open_end, "</forum>") orelse return null;
+    var text = std.mem.trim(u8, block[open_end + 1 .. close_at], " \t\r\n");
+    if (std.mem.startsWith(u8, text, "<![CDATA[")) text = text["<![CDATA[".len..];
+    if (std.mem.endsWith(u8, text, "]]>")) text = text[0 .. text.len - "]]>".len];
+    return text;
+}
+
+/// Copies `text` into `dest`, clipping it at a UTF-8 boundary: the panel prints
+/// these bytes, so a half character would corrupt the whole row.
+fn storeClipped(dest: []u8, text: []const u8) []const u8 {
+    const len = @min(text.len, dest.len);
+    var end = len;
+    if (len < text.len) {
+        while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    }
+    @memcpy(dest[0..end], text[0..end]);
+    return dest[0..end];
 }
 
 /// `name="value"` inside an attribute list. The quote is part of the marker so
@@ -408,6 +450,7 @@ test "rutracker: a record yields its title, hash, tracker and size" {
     try testing.expectEqualStrings("3D9E3C0F6D25349D055D82CFA6401BEE3C9509B2", parsed.hash);
     try testing.expectEqual(@as(u32, 4), parsed.tracker_id);
     try testing.expectEqual(@as(u64, 498667923), parsed.size);
+    try testing.expectEqualStrings("Hi-Res форматы", parsed.forum);
 
     // A record missing the hash cannot be mounted, so it is not a result.
     const no_hash = "<torrent id=\"1\" size=\"2\">\n<title>x</title>\n</torrent>";
