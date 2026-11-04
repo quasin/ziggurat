@@ -57,6 +57,9 @@ pub const Result = struct {
     forum_len: u8 = 0,
     date: [max_date]u8 = undefined,
     date_len: u8 = 0,
+    /// The `<torrent id="…">` of the record: the topic number its page on the
+    /// tracker is addressed by. Zero when the dump recorded none.
+    topic_id: u32 = 0,
     tracker_id: u32 = 1,
     size: u64 = 0,
 
@@ -80,6 +83,21 @@ pub const Result = struct {
         return std.fmt.bufPrint(buf, "magnet:?xt=urn:btih:{s}&tr=http://bt{d}.t-ru.org/ann?magnet", .{
             self.hashText(), self.tracker_id,
         }) catch null;
+    }
+
+    /// The release's page on the tracker, for a row that has an id to build it
+    /// from. The scheme is left out: `https://` is eight columns the first line
+    /// cannot spare, and a browser puts it back on a pasted address.
+    pub fn link(self: *const Result, buf: []u8) ?[]const u8 {
+        if (self.topic_id == 0) return null;
+        return std.fmt.bufPrint(buf, "rutracker.org/forum/viewtopic.php?t={d}", .{self.topic_id}) catch null;
+    }
+
+    /// The link cut down to the topic number, for a panel too narrow to hold
+    /// the whole address: `t=6499008` still names the page.
+    pub fn linkTag(self: *const Result, buf: []u8) ?[]const u8 {
+        if (self.topic_id == 0) return null;
+        return std.fmt.bufPrint(buf, "t={d}", .{self.topic_id}) catch null;
     }
 };
 
@@ -268,7 +286,7 @@ pub const Engine = struct {
         const copy = try self.allocator.dupe(u8, clipTitle(parsed.title));
         errdefer self.allocator.free(copy);
 
-        var result = Result{ .title = copy, .tracker_id = parsed.tracker_id, .size = parsed.size };
+        var result = Result{ .title = copy, .tracker_id = parsed.tracker_id, .topic_id = parsed.topic_id, .size = parsed.size };
         const hash_len = @min(parsed.hash.len, result.hash.len);
         @memcpy(result.hash[0..hash_len], parsed.hash[0..hash_len]);
         result.hash_len = @intCast(hash_len);
@@ -325,6 +343,8 @@ pub const Parsed = struct {
     /// `YYYY.MM.DD` from the record's `registred_at`, empty when the dump has
     /// none — an old or hand-made dump does not, and that is not a failure.
     date: []const u8 = "",
+    /// The `<torrent id="…">` topic number, zero when the record has none.
+    topic_id: u32 = 0,
     tracker_id: u32 = 1,
     size: u64 = 0,
 };
@@ -356,13 +376,20 @@ pub fn parseRecord(block: []const u8) ?Parsed {
     else
         1;
 
+    // The topic number the release's page is addressed by. A record without
+    // one is still a result: it just cannot offer the link.
+    const topic_id = if (attrValue(block[0..open_end], "id")) |text|
+        std.fmt.parseInt(u32, text, 10) catch 0
+    else
+        0;
+
     // The section is printed above the title, so a record without one is still
     // a result: it just shows an empty first line. The date is printed in front
     // of the section and is just as optional.
     const forum = forumText(block) orelse "";
     const date = dateText(block[0..open_end]);
 
-    return .{ .title = title, .hash = hash, .forum = forum, .date = date, .tracker_id = tracker_id, .size = size };
+    return .{ .title = title, .hash = hash, .forum = forum, .date = date, .topic_id = topic_id, .tracker_id = tracker_id, .size = size };
 }
 
 /// The day `<torrent registred_at="2024.03.12 20:11:00">` was registered, with
@@ -399,14 +426,22 @@ fn storeClipped(dest: []u8, text: []const u8) []const u8 {
 }
 
 /// `name="value"` inside an attribute list. The quote is part of the marker so
-/// a title containing `size=` in its CDATA cannot be mistaken for an attribute.
+/// a title containing `size=` in its CDATA cannot be mistaken for an attribute,
+/// and the name must start a word: `id="` inside `tracker_id="` is a different
+/// attribute, and the dump has both.
 fn attrValue(tag: []const u8, name: []const u8) ?[]const u8 {
     var marker_buf: [24]u8 = undefined;
     const marker = std.fmt.bufPrint(&marker_buf, "{s}=\"", .{name}) catch return null;
-    const at = std.mem.indexOf(u8, tag, marker) orelse return null;
-    const rest = tag[at + marker.len ..];
-    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
-    return rest[0..end];
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, tag, from, marker)) |at| {
+        if (at == 0 or tag[at - 1] == '<' or std.ascii.isWhitespace(tag[at - 1])) {
+            const rest = tag[at + marker.len ..];
+            const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+            return rest[0..end];
+        }
+        from = at + 1;
+    }
+    return null;
 }
 
 fn clipTitle(title: []const u8) []const u8 {
@@ -478,6 +513,7 @@ test "rutracker: a record yields its title, hash, tracker and size" {
     try testing.expectEqualStrings("[TR24][OF] Sferro & Tommy ‘86 - Remote Communications", parsed.title);
     try testing.expectEqualStrings("3D9E3C0F6D25349D055D82CFA6401BEE3C9509B2", parsed.hash);
     try testing.expectEqual(@as(u32, 4), parsed.tracker_id);
+    try testing.expectEqual(@as(u32, 6499008), parsed.topic_id);
     try testing.expectEqual(@as(u64, 498667923), parsed.size);
     try testing.expectEqualStrings("Hi-Res форматы", parsed.forum);
     // The clock time is dropped: the row shows the date only.
@@ -499,6 +535,28 @@ test "rutracker: a record without a date still parses, with an empty date" {
     const bare = parseRecord("<torrent id=\"1\" registred_at=\"2024.03.12\" size=\"2\">\n<title>x</title>\n" ++
         "<torrent hash=\"AABB\" tracker_id=\"1\"/>\n</torrent>").?;
     try testing.expectEqualStrings("2024.03.12", bare.date);
+}
+
+test "rutracker: the topic id builds the release's page link" {
+    var result = Result{ .title = @constCast("x"), .topic_id = 6499008 };
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings(
+        "rutracker.org/forum/viewtopic.php?t=6499008",
+        result.link(&buf).?,
+    );
+    var tag_buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("t=6499008", result.linkTag(&tag_buf).?);
+
+    // A record without an id offers neither form.
+    result.topic_id = 0;
+    try testing.expect(result.link(&buf) == null);
+    try testing.expect(result.linkTag(&tag_buf) == null);
+}
+
+test "rutracker: an attribute name must start a word" {
+    // `id="` occurs inside `tracker_id="`; the topic number is the other one.
+    try testing.expectEqualStrings("42", attrValue("<torrent tracker_id=\"9\" id=\"42\"", "id").?);
+    try testing.expectEqualStrings("9", attrValue("<torrent tracker_id=\"9\" id=\"42\"", "tracker_id").?);
 }
 
 test "rutracker: the folded query matches Russian titles in either case" {

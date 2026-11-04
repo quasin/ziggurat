@@ -1616,13 +1616,34 @@ pub const App = struct {
                 // but only when the dump recorded one: an empty date must not
                 // shorten the section for the whole list.
                 const date_width: u16 = if (date.len > 0) term.displayWidth(date) + 1 else 0;
-                // Two columns go to the selection marker, two to the gap the
-                // size leaves on the right.
-                const room_i: i32 = @as(i32, inner_width) - @as(i32, size_width) - 5 - @as(i32, date_width);
-                const room: u16 = @intCast(@max(room_i, 4));
-                const shown = truncateTo(forum, room);
 
-                // The date, then the section on the left, the size against the
+                // The release's page, in front of the size. The whole address is
+                // what a user copies into a browser, but it costs 45 columns: the
+                // section gives way to it, and a panel too narrow even for the
+                // address shows the topic number alone.
+                var link_buf: [64]u8 = undefined;
+                var tag_buf: [24]u8 = undefined;
+                const full = result.link(&link_buf);
+                const tag = result.linkTag(&tag_buf);
+                const room_for_full: i32 = @as(i32, inner_width) - @as(i32, date_width) -
+                    @as(i32, size_width) - 5;
+                const url = if (full) |text|
+                    if (room_for_full - @as(i32, @intCast(term.displayWidth(text))) >= 0)
+                        text
+                    else
+                        tag orelse ""
+                else
+                    "";
+                const url_width: u16 = if (url.len > 0) term.displayWidth(url) + 1 else 0;
+
+                // Two columns go to the selection marker, two to the gap the
+                // size leaves on the right, one to the gap after the section.
+                const room_i: i32 = @as(i32, inner_width) - @as(i32, size_width) - 5 -
+                    @as(i32, date_width) - @as(i32, url_width);
+                const room: u16 = @intCast(@max(room_i, 0));
+                const shown = if (room >= 4) truncateTo(forum, room) else "";
+
+                // The date, the section, the link, then the size against the
                 // right edge, so sizes line up down the panel whatever the
                 // section's length.
                 frame.at(row, left + 1);
@@ -1632,8 +1653,16 @@ pub const App = struct {
                     frame.put(if (selected) .selected else .dim, date);
                     frame.put(if (selected) .selected else .accent, " ");
                 }
-                frame.put(if (selected) .selected else .accent, shown);
-                const used = term.displayWidth(shown) + size_width + date_width;
+                if (shown.len > 0) {
+                    frame.put(if (selected) .selected else .accent, shown);
+                    frame.put(if (selected) .selected else .accent, " ");
+                }
+                if (url.len > 0) {
+                    frame.put(if (selected) .selected else .plain, url);
+                    frame.put(if (selected) .selected else .accent, " ");
+                }
+                const used = date_width + size_width + url_width +
+                    (if (shown.len > 0) term.displayWidth(shown) + 1 else 0);
                 frame.spaces(if (inner_width > used + 4) inner_width - used - 4 else 1);
                 frame.put(if (selected) .selected else .dim, size);
                 frame.endRow();
