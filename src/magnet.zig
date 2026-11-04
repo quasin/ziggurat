@@ -120,25 +120,6 @@ pub fn mountName(source: []const u8, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
-const media_extensions = [_][]const u8{
-    // video
-    "mkv", "mp4", "m4v", "avi", "mov",  "webm", "ts",   "m2ts", "mpg",  "mpeg",
-    "flv", "wmv", "ogv", "vob", "3gp",
-    // audio
-     "mp3",  "flac", "ogg",  "opus", "m4a",
-    "aac", "wav", "wv",  "ape", "alac",
-};
-
-pub fn isMedia(path: []const u8) bool {
-    const ext = std.fs.path.extension(path);
-    if (ext.len < 2) return false;
-    const bare = ext[1..];
-    for (media_extensions) |known| {
-        if (std.ascii.eqlIgnoreCase(bare, known)) return true;
-    }
-    return false;
-}
-
 fn isInfoHash(s: []const u8) bool {
     if (s.len == 40 or s.len == 64) {
         for (s) |ch| if (!std.ascii.isHex(ch)) return false;
@@ -239,12 +220,4 @@ test "magnet: the input line takes a link or a .torrent, nothing else" {
     try testing.expectEqualStrings("file:src/magnet.zig", torrent);
 
     try testing.expect((try parse(a, io, "hello")) == null);
-}
-
-test "magnet: only playable files are media" {
-    try testing.expect(isMedia("release/CD1/track.MKV"));
-    try testing.expect(isMedia("a.flac"));
-    try testing.expect(!isMedia("release/cover.jpg"));
-    try testing.expect(!isMedia("release/notes.txt"));
-    try testing.expect(!isMedia("noext"));
 }

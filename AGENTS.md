@@ -5,8 +5,8 @@ two-panel TUI: a source line on the left (magnet link, bare info-hash or a
 `.torrent` file), the history of what was typed on the
 right; a row mounts a release as a read-only directory (a FUSE 3 mount served by
 a `rekarma` daemon) and lists every folder and file inside it. Enter hands a
-media file to `vlc` and anything else to `--open` (xdg-open), and the reader's
-reads are what pull the pieces on demand. Published targets: x86_64, aarch64, riscv64 (all linux-gnu).
+file to the desktop's default application through `--open` (xdg-open), and that
+program's reads are what pull the pieces on demand. Published targets: x86_64, aarch64, riscv64 (all linux-gnu).
 
 Ziggurat itself does not download anything and does not link librats. The
 torrent, the mount and the piece scheduling live behind `--rekarma <binary>`,
@@ -26,8 +26,8 @@ will actually run.
     zig fmt --check build.zig src            # formatting gate (no output = clean)
 
 Requires Zig **0.17.0** only: there is no vendor step and no cross toolchain.
-Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
-`PATH`, or `--rekarma` / `--vlc` pointing at them.
+Running the interface needs `rekarma` (itself built with libfuse3) and
+`xdg-open` on `PATH`, or `--rekarma` / `--open` pointing at them.
 
 ## Layout
 
@@ -170,12 +170,13 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
 - **A mount is not necessarily a playable release, so the files view lists
   everything.** The dump holds books and archives as often as video: `files`
   now holds every directory and file of the mount (`procs.listEntries`, capped
-  at 2000 rows), printed as a tree indented by path depth, and Enter sends
-  media to `--vlc` but everything else — a PDF, an archive, a folder — to
-  `--open` (xdg-open). Filtering the list to media is what made a mounted book
-  look like a failed mount. The listing opens by itself when the row that
-  finished mounting is the selected one, and `reportMountMedia` still states
-  "файлов: N, папок: M" so the status is never a bare "смонтирован".
+  at 2000 rows), printed as a tree indented by path depth, and Enter sends every
+  one of them — a film, a PDF, an archive, a folder — to `--open` (xdg-open),
+  which starts the desktop's default application for the type. Filtering the
+  list to media is what made a mounted book look like a failed mount. The
+  listing opens by itself when the row that finished mounting is the selected
+  one, and `reportMountMedia` still states "файлов: N, папок: M" so the status
+  is never a bare "смонтирован".
 - **A daemon per release needs its own cache dir**, `<cache>/<hash>`: rekarma
   writes `magnet.pid`/`magnet.log` into `--cache`, so two releases sharing one
   directory would overwrite each other's pid and stop the wrong mount.

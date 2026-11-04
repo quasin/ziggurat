@@ -1,6 +1,6 @@
 //! Everything outside this process: the mounted releases (rekarma daemon),
-//! the player (vlc) and the filesystem facts the TUI asks about. Kept out of
-//! `tui.zig` so the screen code stays about the screen.
+//! the desktop opener a release's files go to, and the filesystem facts the TUI
+//! asks about. Kept out of `tui.zig` so the screen code stays about the screen.
 const std = @import("std");
 const Io = std.Io;
 const linux = std.os.linux;
@@ -9,10 +9,9 @@ const magnet = @import("magnet.zig");
 pub const Config = struct {
     /// The binary that mounts a release; rekarma, by default.
     rekarma: []const u8 = "rekarma",
-    /// The binary that plays one; vlc, by default.
-    player: []const u8 = "vlc",
-    /// The desktop opener behind every non-media file of a release: a book, an
-    /// archive or a folder goes here instead of to the player.
+    /// The desktop's default application for a release's files, chosen by
+    /// xdg-open from the extension: a film plays, a book opens in a reader, a
+    /// folder in a file manager. The interface names no player of its own.
     opener: []const u8 = "xdg-open",
     /// Where releases are mounted: <mount_root>/<8-char hash>.
     mount_root: []const u8 = "mnt",
@@ -234,9 +233,10 @@ pub fn reapCode(pid: std.posix.pid_t) ?u32 {
     return @intCast((status >> 8) & 0xff);
 }
 
-/// Hands a file inside the mount to a program: the player for media, the
-/// desktop opener for everything else. The path stays inside the FUSE mount, so
-/// whatever reads it is what pulls the pieces — nothing is copied out.
+/// Hands a file inside the mount to the desktop opener, which starts whatever
+/// is registered for that type. The path itself is passed, never a copy, so the
+/// player or reader then reads through the mount and those reads are what pull
+/// the pieces.
 pub fn launch(io: Io, exe: []const u8, path: []const u8) !std.posix.pid_t {
     const child = try std.process.spawn(io, .{
         .argv = &.{ exe, path },
@@ -247,8 +247,8 @@ pub fn launch(io: Io, exe: []const u8, path: []const u8) !std.posix.pid_t {
     return child.id orelse error.NoPid;
 }
 
-/// Reaps a finished player without blocking the event loop. A player that is
-/// still running answers 0, which is not an error.
+/// Reaps a finished child without blocking the event loop. One that is still
+/// running answers nothing, which is not an error.
 pub fn reap(pid: std.posix.pid_t) void {
     var status: i32 = 0;
     _ = linux.waitpid(pid, &status, linux.W.NOHANG);

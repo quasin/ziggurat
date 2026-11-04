@@ -6,9 +6,11 @@ The left panel is a source line — a magnet link, a bare info-hash, or a
 `.torrent` file; the right one is the history of what you typed.
 Enter mounts the release as a read-only directory (a FUSE 3 mount served by
 `rekarma`, which owns the librats bittorrent stack),
-Enter on a mounted row lists its media files, and Enter on a file starts `vlc` on
-it. The player's reads are what pull the pieces, so playback starts long before
-the release is complete: browsing a 100 GB release costs its metadata only.
+Enter on a mounted row lists every folder and file of the release, and Enter on a
+file hands it to the desktop's default application — a film plays, a book opens
+in a reader. That program's reads are what pull the pieces, so playback starts
+long before the release is complete: browsing a 100 GB release costs its
+metadata only.
 
 ```
 ┌─ Ввод ───────────────────────┐┌─ История ───────────────────────────┐
@@ -35,7 +37,9 @@ Watching a release needs two more programs on `PATH` (both overridable):
   starts it as a daemon per release:
   `rekarma --magnet <link>|--torrent <file> -m <dir> --cache <dir> --daemon`.
   That binary needs libfuse3 at build and run time.
-- `vlc` — the player, started as `vlc <path-inside-the-mount>`.
+- `xdg-open` — hands a file of the mount to the desktop's default application,
+  started as `xdg-open <path-inside-the-mount>`. Ziggurat names no player of its
+  own: a film opens in whatever plays video, a book in whatever reads it.
 
 `--help` and `--version` ask rekarma for its own and librats' versions
 (`rekarma --version`); ziggurat has no librats of its own to report, and the
@@ -67,7 +71,7 @@ file, so it can be browsed with no peer at all. Quote a link in a shell: `?` and
     .ziggurat/cache/<hash>/magnet.pid    its pid: kill $(cat …) stops it
     .ziggurat/history.tsv                the history (magnet, mount, title)
 
-`--mount-root`, `--cache`, `--history`, `--rekarma` and `--vlc` move all of it.
+`--mount-root`, `--cache`, `--history`, `--rekarma` and `--open` move all of it.
 A mount that never produces metadata is reported as `ошибка` after three
 minutes, with the last line of the daemon's log as the reason.
 

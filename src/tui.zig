@@ -1,6 +1,7 @@
 //! The two panels: a source line on the left (a magnet link or a .torrent file),
-//! the history of what was typed on the right. Every row action (mount, unmount, play through vlc) is a key on
-//! the selected row, so the screen never needs a menu.
+//! the history of what was typed on the right. Every row action (mount, unmount,
+//! open through the desktop) is a key on the selected row, so the screen never
+//! needs a menu.
 const std = @import("std");
 const Io = std.Io;
 const term = @import("term.zig");
@@ -106,14 +107,14 @@ pub const Options = struct {
     /// ziggurat links no librats of its own to ask.
     rekarma_version: []const u8,
     history_path: []const u8,
-    /// Where `--rekarma` / `--vlc` / `--open` resolved to, or null when the
-    /// program is not on PATH. Resolved once at startup so a missing program is
-    /// a message, not a failed spawn three keystrokes later.
+    /// Where `--rekarma` / `--open` resolved to, or null when the program is
+    /// not on PATH. Resolved once at startup so a missing program is a message,
+    /// not a failed spawn three keystrokes later.
     rekarma_exe: ?[]const u8,
-    player_exe: ?[]const u8,
-    /// The desktop opener behind a non-media file: a book or an archive has no
-    /// business in a media player, and the mount is a plain directory to
-    /// whatever the desktop associates with the extension.
+    /// The desktop's default application, behind every file of a mounted
+    /// release: video plays, a book opens in a reader, a folder in a file
+    /// manager. The mount is a plain directory to whatever the desktop
+    /// associates with the type.
     opener_exe: ?[]const u8 = null,
     /// The two tools behind the RuTracker database link: `ant` fetches the
     /// archive, `xz -d` unpacks it in place.
@@ -203,7 +204,9 @@ pub const App = struct {
     status_buf: [240]u8 = @splat(0),
     status_len: usize = 0,
     status_style: term.Style = .dim,
-    players: std.ArrayList(std.posix.pid_t),
+    /// The children the desktop opener started: a player or a reader outlives
+    /// the frame that launched it, so its pid waits here to be reaped.
+    opened: std.ArrayList(std.posix.pid_t),
     /// The installer runs far longer than a player, so its pid stays here
     /// until `reapIfDone` sees it exit instead of being dropped after one poll.
     install_pid: ?std.posix.pid_t = null,
@@ -224,7 +227,7 @@ pub const App = struct {
             .files_arena = std.heap.ArenaAllocator.init(allocator),
             .room_lines = .empty,
             .compose = .empty,
-            .players = .empty,
+            .opened = .empty,
             .db = rutracker.Engine.init(allocator),
             .db_query = .empty,
         };
@@ -243,9 +246,9 @@ pub const App = struct {
                 config.rekarma,
             }) catch "";
             app.setStatus(text, .warn);
-        } else if (options.player_exe == null) {
+        } else if (options.opener_exe == null) {
             var buf: [240]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, "vlc не найден: {s} — укажите --vlc <путь>", .{config.player}) catch "";
+            const text = std.fmt.bufPrint(&buf, "xdg-open не найден: {s} — укажите --open <путь>", .{config.opener}) catch "";
             app.setStatus(text, .warn);
         }
         return app;
@@ -260,7 +263,7 @@ pub const App = struct {
         self.clearRoom();
         self.room_lines.deinit(self.allocator);
         self.compose.deinit(self.allocator);
-        self.players.deinit(self.allocator);
+        self.opened.deinit(self.allocator);
         self.db.deinit();
         self.db_query.deinit(self.allocator);
         if (self.db_path) |path| self.allocator.free(path);
@@ -1056,24 +1059,16 @@ pub const App = struct {
         self.setStatus(text, .dim);
     }
 
-    /// Enter on a row of the files view: media goes to the player named by
-    /// `--vlc`, anything else to the desktop opener — a book, an archive or a
-    /// whole directory has no business in a media player, and the mount is an
-    /// ordinary directory to whatever the desktop has for that extension.
-    /// Either program reads through the mount, so its reads pull the pieces.
+    /// Enter on a row of the files view: the file goes to the desktop's default
+    /// application, whatever it is — a film to a player, a book to a reader, a
+    /// folder to a file manager. That program reads through the mount, so its
+    /// reads are what pull the pieces.
     fn openEntry(self: *App, index: usize) !void {
         if (index >= self.files.items.len) return;
         const item = self.files.items[index];
-        const media = !item.dir and magnet.isMedia(item.path);
 
-        const exe = (if (media) self.options.player_exe else self.options.opener_exe) orelse {
-            self.setStatus(
-                if (media)
-                    "vlc не найден в PATH — укажите --vlc <путь>"
-                else
-                    "xdg-open не найден в PATH — укажите --open <путь>",
-                .err,
-            );
+        const exe = self.options.opener_exe orelse {
+            self.setStatus("xdg-open не найден в PATH — укажите --open <путь>", .err);
             return;
         };
         const pid = procs.launch(self.io, exe, item.path) catch |err| {
@@ -1082,14 +1077,11 @@ pub const App = struct {
             self.setStatus(text, .err);
             return;
         };
-        try self.players.append(self.allocator, pid);
+        try self.opened.append(self.allocator, pid);
 
         var buf: [200]u8 = undefined;
         const base = std.fs.path.basename(item.path);
-        const text = std.fmt.bufPrint(&buf, "{s}: {s}", .{
-            if (media) "vlc" else "открываю",
-            truncateTo(base, 120),
-        }) catch "открываю файл";
+        const text = std.fmt.bufPrint(&buf, "открываю: {s}", .{truncateTo(base, 120)}) catch "открываю файл";
         self.setStatus(text, .ok);
     }
 
@@ -1121,7 +1113,7 @@ pub const App = struct {
     }
 
     /// Per-tick work that is cheap and must stay out of the draw path: a mount
-    /// that came up, one that never will, and finished players that would
+    /// that came up, one that never will, and finished children that would
     /// otherwise stay zombies.
     fn housekeeping(self: *App) void {
         for (self.list.items.items, 0..) |entry, i| {
@@ -1158,8 +1150,8 @@ pub const App = struct {
             }
         }
 
-        for (self.players.items) |pid| procs.reap(pid);
-        self.players.clearRetainingCapacity();
+        for (self.opened.items) |pid| procs.reap(pid);
+        self.opened.clearRetainingCapacity();
 
         // The room view is a tail: it has to follow the file while it is open,
         // and costs one stat when nothing arrived.
@@ -1374,7 +1366,7 @@ pub const App = struct {
     fn drawTitle(self: *App, frame: *term.Frame, size: term.Size) void {
         frame.at(1, 1);
         frame.put(.title, " ziggurat ");
-        frame.put(.plain, "p2p-релизы: magnet/.torrent → монтирование → vlc");
+        frame.put(.plain, "p2p-релизы: magnet/.torrent → монтирование → приложение по умолчанию");
         frame.endRow();
 
         var buf: [128]u8 = undefined;
@@ -1385,7 +1377,7 @@ pub const App = struct {
         else
             std.fmt.bufPrint(&buf, "ziggurat {s} ", .{self.options.version}) catch return;
         const width = term.displayWidth(right);
-        const used = 10 + term.displayWidth("p2p-релизы: magnet/.torrent → монтирование → vlc");
+        const used = 10 + term.displayWidth("p2p-релизы: magnet/.torrent → монтирование → приложение по умолчанию");
         if (size.cols > used + width) {
             frame.at(1, size.cols - width + 1);
             frame.put(.dim, right);
