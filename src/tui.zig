@@ -813,6 +813,7 @@ pub const App = struct {
         var buf: [240]u8 = undefined;
         switch (outcome) {
             .done => {
+                self.resetDatabaseSelection();
                 const text = if (found == 0)
                     std.fmt.bufPrint(&buf, "в базе ничего не найдено по этому запросу", .{}) catch ""
                 else
@@ -820,12 +821,21 @@ pub const App = struct {
                 self.setStatus(text, if (found == 0) .warn else .ok);
             },
             .stopped => {
+                self.resetDatabaseSelection();
                 const text = std.fmt.bufPrint(&buf, "найдено {d} — поиск остановлен на лимите, уточните запрос", .{found}) catch "";
                 self.setStatus(text, if (found == 0) .warn else .dim);
             },
             .failed => self.setStatus("не удалось прочитать базу: файл повреждён или это не дамп", .err),
             .none => {},
         }
+    }
+
+    /// The matches are sorted by date once the scan ends, so the row the
+    /// selection stood on now holds another release: it goes back to the
+    /// newest one instead of mounting something the user did not pick.
+    fn resetDatabaseSelection(self: *App) void {
+        self.db_selected = 0;
+        self.db_scroll = 0;
     }
 
     /// Enter on the room shortcut: the right panel turns into the room, and a

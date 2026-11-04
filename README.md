@@ -105,7 +105,9 @@ source line and the release is mounted from there, exactly as if it had been
 pasted. The panel keeps at most 300 matches and stops scanning once it has
 them, so a common word answers in seconds and a rare one after one full pass
 (about 30 s for 30 GB from a warm page cache in a ReleaseSafe build; a Debug
-build scans several times slower). `rutracker-*.xml` is listed in `.gitignore`
+build scans several times slower). Matches are listed newest first: the scan
+sorts them by the release date once it ends, so a row that appears mid-scan can
+still move. `rutracker-*.xml` is listed in `.gitignore`
 either way — it is tens of gigabytes.
 
 ## License

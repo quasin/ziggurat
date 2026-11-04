@@ -95,6 +95,17 @@ pub const Result = struct {
     }
 };
 
+/// Newest first for the panel's list. A record the dump wrote without a date
+/// cannot be placed on that line, so it goes after the dated ones instead of
+/// sorting as the oldest; the dates are `YYYY.MM.DD`, which compares as text.
+fn newerFirst(_: void, a: Result, b: Result) bool {
+    const left = a.dateText();
+    const right = b.dateText();
+    if (left.len == 0) return false;
+    if (right.len == 0) return true;
+    return std.mem.order(u8, left, right) == .gt;
+}
+
 /// What a scan reports when it is over. `running` is not part of it because the
 /// UI asks the atomics for that: the outcome is written once, a frame at a time.
 pub const Outcome = enum(u8) { none = 0, done = 1, failed = 2, stopped = 3 };
@@ -197,8 +208,21 @@ pub const Engine = struct {
         } else if (self.found.load(.monotonic) >= max_results) {
             stopped = true;
         }
+        // The dump answers in file order, which is neither chronological nor
+        // useful; the panel wants the newest releases first, so the matches are
+        // sorted once, after the scan, and before the outcome says it is over.
+        self.sortByDate();
         self.outcome.store(@backingInt(if (stopped) Outcome.stopped else Outcome.done), .release);
         self.running.store(false, .release);
+    }
+
+    /// Newest first, taken under the lock: the screen copies a row at a time
+    /// and must never see the array half-swapped. The sort is stable, so
+    /// releases registered the same day keep the order the dump had.
+    fn sortByDate(self: *Engine) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.sort.block(Result, self.results.items, {}, newerFirst);
     }
 
     fn scanFile(self: *Engine, path: []const u8) !void {
@@ -549,6 +573,32 @@ test "rutracker: an attribute name must start a word" {
     // `id="` occurs inside `tracker_id="`; the topic number is the other one.
     try testing.expectEqualStrings("42", attrValue("<torrent tracker_id=\"9\" id=\"42\"", "id").?);
     try testing.expectEqualStrings("9", attrValue("<torrent tracker_id=\"9\" id=\"42\"", "tracker_id").?);
+}
+
+test "rutracker: a finished scan answers newest first" {
+    const a = testing.allocator;
+    var engine = Engine.init(a);
+    // The titles are literals, so the engine's own deinit (which frees them)
+    // is not used here: only the list's buffer belongs to the test.
+    defer engine.results.deinit(a);
+
+    const rows = [_]struct { date: []const u8, title: []const u8 }{
+        .{ .date = "2021.11.02", .title = "middle" },
+        .{ .date = "", .title = "undated" },
+        .{ .date = "2024.03.12", .title = "newest" },
+        .{ .date = "2019.01.01", .title = "oldest" },
+    };
+    for (rows) |row| {
+        var result = Result{ .title = @constCast(row.title) };
+        const date = storeClipped(&result.date, row.date);
+        result.date_len = @intCast(date.len);
+        try engine.results.append(a, result);
+    }
+
+    engine.sortByDate();
+
+    const order = [_][]const u8{ "newest", "middle", "oldest", "undated" };
+    for (order, 0..) |title, i| try testing.expectEqualStrings(title, engine.results.items[i].title);
 }
 
 test "rutracker: the folded query matches Russian titles in either case" {
