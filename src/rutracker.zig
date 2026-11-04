@@ -86,18 +86,12 @@ pub const Result = struct {
     }
 
     /// The release's page on the tracker, for a row that has an id to build it
-    /// from. The scheme is left out: `https://` is eight columns the first line
-    /// cannot spare, and a browser puts it back on a pasted address.
+    /// from. The scheme is part of it: a terminal only turns a full `https://`
+    /// address into something a click can open, and the link has a row of its
+    /// own, so its 53 columns cost nothing.
     pub fn link(self: *const Result, buf: []u8) ?[]const u8 {
         if (self.topic_id == 0) return null;
-        return std.fmt.bufPrint(buf, "rutracker.org/forum/viewtopic.php?t={d}", .{self.topic_id}) catch null;
-    }
-
-    /// The link cut down to the topic number, for a panel too narrow to hold
-    /// the whole address: `t=6499008` still names the page.
-    pub fn linkTag(self: *const Result, buf: []u8) ?[]const u8 {
-        if (self.topic_id == 0) return null;
-        return std.fmt.bufPrint(buf, "t={d}", .{self.topic_id}) catch null;
+        return std.fmt.bufPrint(buf, "https://rutracker.org/forum/viewtopic.php?t={d}", .{self.topic_id}) catch null;
     }
 };
 
@@ -540,17 +534,15 @@ test "rutracker: a record without a date still parses, with an empty date" {
 test "rutracker: the topic id builds the release's page link" {
     var result = Result{ .title = @constCast("x"), .topic_id = 6499008 };
     var buf: [96]u8 = undefined;
+    // The scheme is what makes the address clickable in a terminal.
     try testing.expectEqualStrings(
-        "rutracker.org/forum/viewtopic.php?t=6499008",
+        "https://rutracker.org/forum/viewtopic.php?t=6499008",
         result.link(&buf).?,
     );
-    var tag_buf: [24]u8 = undefined;
-    try testing.expectEqualStrings("t=6499008", result.linkTag(&tag_buf).?);
 
-    // A record without an id offers neither form.
+    // A record without an id has no page to offer.
     result.topic_id = 0;
     try testing.expect(result.link(&buf) == null);
-    try testing.expect(result.linkTag(&tag_buf) == null);
 }
 
 test "rutracker: an attribute name must start a word" {
