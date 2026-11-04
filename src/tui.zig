@@ -1585,9 +1585,9 @@ pub const App = struct {
         frame.put(.dim, truncateTo(head, inner_width -| 1));
         frame.endRow();
 
-        // Every release takes two rows — the section with its size, then the
-        // title — so the query and the progress line leave half as many
-        // releases on screen. Scrolling counts releases, not rows.
+        // Every release takes two rows — the date and section with its size,
+        // then the title — so the query and the progress line leave half as
+        // many releases on screen. Scrolling counts releases, not rows.
         const rows: usize = if (height > 4) height - 4 else 0;
         const recs: usize = rows / 2;
         self.db_rows = recs;
@@ -1609,21 +1609,31 @@ pub const App = struct {
                 var size_buf: [24]u8 = undefined;
                 const size = sizeText(&size_buf, result.size);
                 const size_width = term.displayWidth(size);
+                const date = result.dateText();
                 const forum_text = result.forumText();
                 const forum = if (forum_text.len > 0) forum_text else "раздел не указан";
+                // The date leads the line and takes its ten columns plus a gap,
+                // but only when the dump recorded one: an empty date must not
+                // shorten the section for the whole list.
+                const date_width: u16 = if (date.len > 0) term.displayWidth(date) + 1 else 0;
                 // Two columns go to the selection marker, two to the gap the
                 // size leaves on the right.
-                const room_i: i32 = @as(i32, inner_width) - @as(i32, size_width) - 5;
+                const room_i: i32 = @as(i32, inner_width) - @as(i32, size_width) - 5 - @as(i32, date_width);
                 const room: u16 = @intCast(@max(room_i, 4));
                 const shown = truncateTo(forum, room);
 
-                // The section on the left, the size against the right edge, so
-                // sizes line up down the panel whatever the section's length.
+                // The date, then the section on the left, the size against the
+                // right edge, so sizes line up down the panel whatever the
+                // section's length.
                 frame.at(row, left + 1);
                 frame.put(if (selected) .selected else .dim, if (selected) "▸" else " ");
                 frame.put(if (selected) .selected else .accent, " ");
+                if (date.len > 0) {
+                    frame.put(if (selected) .selected else .dim, date);
+                    frame.put(if (selected) .selected else .accent, " ");
+                }
                 frame.put(if (selected) .selected else .accent, shown);
-                const used = term.displayWidth(shown) + size_width;
+                const used = term.displayWidth(shown) + size_width + date_width;
                 frame.spaces(if (inner_width > used + 4) inner_width - used - 4 else 1);
                 frame.put(if (selected) .selected else .dim, size);
                 frame.endRow();

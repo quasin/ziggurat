@@ -8,7 +8,7 @@
 //! The dump is written by the tracked user, not by us: one record per release,
 //! with the attributes this module reads
 //!
-//!     <torrent id="…" registred_at="…" size="…">
+//!     <torrent id="…" registred_at="2024.03.12 20:11:00" size="…">
 //!      <title><![CDATA[…]]></title>
 //!      <torrent hash="…" tracker_id="4"/>
 //!      <forum id="…">…</forum>
@@ -44,12 +44,19 @@ const chunk_size: usize = 1 << 20;
 /// scan cost 600 frees. Long forum names are clipped anyway.
 pub const max_forum: usize = 96;
 
+/// The registration date as `YYYY.MM.DD`. The dump writes it with the time of
+/// day (`2024-03-12 20:11:00`), which the row has no columns for: the date
+/// alone is what tells a fresh release from an old one at a glance.
+pub const max_date: usize = 10;
+
 pub const Result = struct {
     title: []u8,
     hash: [64]u8 = undefined,
     hash_len: u8 = 0,
     forum: [max_forum]u8 = undefined,
     forum_len: u8 = 0,
+    date: [max_date]u8 = undefined,
+    date_len: u8 = 0,
     tracker_id: u32 = 1,
     size: u64 = 0,
 
@@ -59,6 +66,12 @@ pub const Result = struct {
 
     pub fn forumText(self: *const Result) []const u8 {
         return self.forum[0..self.forum_len];
+    }
+
+    /// Empty for a record the dump wrote without a date; the row then starts
+    /// with the section, as it did before.
+    pub fn dateText(self: *const Result) []const u8 {
+        return self.date[0..self.date_len];
     }
 
     /// The magnet link the row stands for: the info-hash and the tracker the
@@ -261,6 +274,8 @@ pub const Engine = struct {
         result.hash_len = @intCast(hash_len);
         const forum = storeClipped(&result.forum, parsed.forum);
         result.forum_len = @intCast(forum.len);
+        const date = storeClipped(&result.date, parsed.date);
+        result.date_len = @intCast(date.len);
 
         self.lock();
         defer self.mutex.unlock();
@@ -307,6 +322,9 @@ pub const Parsed = struct {
     title: []const u8,
     hash: []const u8,
     forum: []const u8 = "",
+    /// `YYYY.MM.DD` from the record's `registred_at`, empty when the dump has
+    /// none — an old or hand-made dump does not, and that is not a failure.
+    date: []const u8 = "",
     tracker_id: u32 = 1,
     size: u64 = 0,
 };
@@ -339,10 +357,21 @@ pub fn parseRecord(block: []const u8) ?Parsed {
         1;
 
     // The section is printed above the title, so a record without one is still
-    // a result: it just shows an empty first line.
+    // a result: it just shows an empty first line. The date is printed in front
+    // of the section and is just as optional.
     const forum = forumText(block) orelse "";
+    const date = dateText(block[0..open_end]);
 
-    return .{ .title = title, .hash = hash, .forum = forum, .tracker_id = tracker_id, .size = size };
+    return .{ .title = title, .hash = hash, .forum = forum, .date = date, .tracker_id = tracker_id, .size = size };
+}
+
+/// The day `<torrent registred_at="2024.03.12 20:11:00">` was registered, with
+/// the time of day dropped: the row can afford ten columns for a date and not
+/// nineteen, and a dump without the attribute yields an empty slice.
+fn dateText(tag: []const u8) []const u8 {
+    const text = attrValue(tag, "registred_at") orelse return "";
+    const end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
+    return text[0..@min(end, max_date)];
 }
 
 /// The text of `<forum id="…">…</forum>`: the section of the dump the release
@@ -451,10 +480,25 @@ test "rutracker: a record yields its title, hash, tracker and size" {
     try testing.expectEqual(@as(u32, 4), parsed.tracker_id);
     try testing.expectEqual(@as(u64, 498667923), parsed.size);
     try testing.expectEqualStrings("Hi-Res форматы", parsed.forum);
+    // The clock time is dropped: the row shows the date only.
+    try testing.expectEqualStrings("2024.03.12", parsed.date);
 
     // A record missing the hash cannot be mounted, so it is not a result.
     const no_hash = "<torrent id=\"1\" size=\"2\">\n<title>x</title>\n</torrent>";
     try testing.expect(parseRecord(no_hash) == null);
+}
+
+test "rutracker: a record without a date still parses, with an empty date" {
+    const block = "<torrent id=\"1\" size=\"2\">\n<title>x</title>\n" ++
+        "<torrent hash=\"AABB\" tracker_id=\"1\"/>\n</torrent>";
+    const parsed = parseRecord(block).?;
+    try testing.expectEqualStrings("", parsed.date);
+
+    // A date attr in the right shape but without its time of day is taken whole
+    // rather than cut at a space that is not there.
+    const bare = parseRecord("<torrent id=\"1\" registred_at=\"2024.03.12\" size=\"2\">\n<title>x</title>\n" ++
+        "<torrent hash=\"AABB\" tracker_id=\"1\"/>\n</torrent>").?;
+    try testing.expectEqualStrings("2024.03.12", bare.date);
 }
 
 test "rutracker: the folded query matches Russian titles in either case" {
@@ -517,7 +561,7 @@ test "rutracker: the scanner keeps every complete record across chunk edges" {
     defer pending.deinit(a);
     try pending.ensureTotalCapacity(a, 512);
 
-    const first = "<torrent id=\"1\" size=\"10\">\n<title>needle one</title>\n<torrent hash=\"" ++
+    const first = "<torrent id=\"1\" registred_at=\"2024.03.12 20:11:00\" size=\"10\">\n<title>needle one</title>\n<torrent hash=\"" ++
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" ++ "\" tracker_id=\"1\"/>\n</torrent>";
     const second = "<torrent id=\"2\" size=\"20\">\n<title>other</title>\n<torrent hash=\"" ++
         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" ++ "\" tracker_id=\"1\"/>\n</torrent>";
@@ -534,5 +578,6 @@ test "rutracker: the scanner keeps every complete record across chunk edges" {
     try testing.expect(engine.resultAt(0, &result));
     try testing.expectEqualStrings("needle one", result.title);
     try testing.expectEqual(@as(u64, 10), result.size);
+    try testing.expectEqualStrings("2024.03.12", result.dateText());
     try testing.expect(!engine.resultAt(1, &result));
 }
