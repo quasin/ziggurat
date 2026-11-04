@@ -4,14 +4,24 @@ const build_options = @import("build_options");
 const procs = @import("procs.zig");
 const term = @import("term.zig");
 const tui = @import("tui.zig");
+const magnet = @import("magnet.zig");
+const history = @import("history.zig");
+const rutracker = @import("rutracker.zig");
 
 test {
     // A module reached only from `main()` is never analyzed in a test build, so
-    // its own `test` blocks would drop out of the artifact without a word:
-    // naming the imports here is what keeps `zig build test` covering the screen
-    // and the terminal at all.
+    // its own `test` blocks would drop out of the artifact without a word.
+    // Naming every import here is what keeps `zig build test` covering the
+    // screen, the terminal, the dump and the history: a file imported by an
+    // analyzed file is NOT enough on its own, because only the decls the tests
+    // reach are analyzed — `rutracker` and `history` are used by drawing code
+    // the suite never runs, which is exactly how seven tests were skipped.
     _ = tui;
     _ = term;
+    _ = procs;
+    _ = rutracker;
+    _ = history;
+    _ = magnet;
 }
 
 /// What the command line asked for. Kept separate from `main` so the parser is

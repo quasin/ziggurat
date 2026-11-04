@@ -98,7 +98,14 @@ Running the interface needs `rekarma` (itself built with libfuse3) and `vlc` on
   file reached only through `main()` is not analyzed in a test build, and its
   tests drop out of the artifact silently (`tui.zig`, `term.zig` did until
   `main.zig` gained a `test { _ = tui; _ = term; }`); `zig build test --summary
-  all` showing fewer tests than `grep -c '^test ' src/*.zig` is that bug.
+  all` showing fewer tests than `grep -c '^test ' src/*.zig` is that bug. Being
+  imported by an already-named file is **not** enough: only the decls the tests
+  actually reach are analyzed, so `rutracker.zig` and `history.zig` stayed out
+  (seven tests) even though `tui.zig` imports both — name every file in that
+  `test` block. Skipped tests also hide failing ones: `rutracker`'s suite had
+  one broken test (a raw uppercase query fed to `matches`, which expects the
+  folded form `start` produces) that only appeared once the file was wired in.
+  The sum of `grep -c '^test '` is the number the run must report.
 - **Do not add a librats dependency back to ziggurat.** The library belongs to
   rekarma, the binary that mounts and downloads; ziggurat only spawns it and asks
   for `--version`. Linking it again reintroduces the per-triple C++ vendoring,

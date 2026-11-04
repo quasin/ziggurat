@@ -484,9 +484,10 @@ test "rutracker: space-separated words match anywhere in the title" {
     try testing.expect(engine.matches("Проектирование на паттернах", "AABB", &buf));
     // One missing word is enough to reject the record.
     try testing.expect(!engine.matches("Паттерны без второго слова", "AABB", &buf));
-    // A single word stays a plain substring search.
+    // A single word stays a plain substring search. The query is folded by
+    // `start` before `matches` ever sees it, so this line stores it folded.
     engine.query.clearRetainingCapacity();
-    try engine.query.appendSlice(a, "ПАТТЕРНЫ");
+    try engine.query.appendSlice(a, "паттерны");
     try testing.expect(engine.matches("Паттерны проектирования", "AABB", &buf));
 }
 
