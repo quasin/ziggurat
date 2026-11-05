@@ -2,6 +2,7 @@
 //! the desktop opener a release's files go to, and the filesystem facts the TUI
 //! asks about. Kept out of `tui.zig` so the screen code stays about the screen.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const linux = std.os.linux;
 const magnet = @import("magnet.zig");
@@ -284,7 +285,18 @@ pub const ant_client_url = "https://raw.githubusercontent.com/WithAutonomi/ant-c
 
 /// The static build of qBittorrent's headless client: one file, no package
 /// manager, and the version the service runs is exactly the one named here.
-pub const qbittorrent_url = "https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-5.3.0_v2.1.2/x86_64-qbittorrent-nox";
+/// The release directory is fixed; the file inside it is chosen by the
+/// architecture this binary was compiled for, so an aarch64 or riscv64 ziggurat
+/// installs the client it can actually run.
+pub const qbittorrent_release = "https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-5.3.0_v2.1.2/";
+pub const qbittorrent_asset: ?[]const u8 = switch (builtin.cpu.arch) {
+    .x86_64 => "x86_64-qbittorrent-nox",
+    .aarch64 => "aarch64-qbittorrent-nox",
+    .riscv64 => "riscv64-qbittorrent-nox",
+    // Not a build target of this project; the shortcut refuses instead of the
+    // whole program failing to compile over one optional installer.
+    else => null,
+};
 
 /// The port the WebUI of ziggurat's qBittorrent answers on.
 pub const qbittorrent_webui_port: u16 = 8090;
@@ -350,14 +362,14 @@ pub fn qbittorrentConfigPath(allocator: std.mem.Allocator, home: []const u8) ![]
 /// the unit and the profile config are already written by ziggurat, so the job
 /// here is the file and the service manager. `.new` plus `mv` keeps a running
 /// binary from being replaced mid-read.
-pub fn qbittorrentCommand(buf: []u8, home: []const u8) ![]const u8 {
+pub fn qbittorrentCommand(buf: []u8, home: []const u8, asset: []const u8) ![]const u8 {
     return std.fmt.bufPrint(
         buf,
-        "mkdir -p \"{s}/.local/bin\" && curl -fsSL {s} -o \"{s}/.local/bin/qbittorrent-nox.new\" && " ++
+        "mkdir -p \"{s}/.local/bin\" && curl -fsSL {s}{s} -o \"{s}/.local/bin/qbittorrent-nox.new\" && " ++
             "chmod +x \"{s}/.local/bin/qbittorrent-nox.new\" && " ++
             "mv -f \"{s}/.local/bin/qbittorrent-nox.new\" \"{s}/.local/bin/qbittorrent-nox\" && " ++
             "systemctl --user daemon-reload && systemctl --user enable --now qbittorrent-nox.service",
-        .{ home, qbittorrent_url, home, home, home, home },
+        .{ home, qbittorrent_release, asset, home, home, home, home },
     );
 }
 
@@ -808,6 +820,22 @@ test "procs: the WebUI account is written once and then left alone" {
         "[WebUI]\nUsername=admin\nPassword_PBKDF2=\"@ByteArray(CCCC:DDDD)\"\n",
         text,
     );
+}
+
+test "procs: the qBittorrent asset is the build of this architecture" {
+    const asset = qbittorrent_asset.?;
+    try testing.expect(std.mem.startsWith(u8, asset, @tagName(builtin.cpu.arch)));
+    try testing.expect(std.mem.endsWith(u8, asset, "-qbittorrent-nox"));
+}
+
+test "procs: the qBittorrent command fetches the build of this architecture" {
+    var buf: [4096]u8 = undefined;
+    const asset = qbittorrent_asset.?;
+    const command = try qbittorrentCommand(&buf, "/home/u", asset);
+
+    var url_buf: [256]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "{s}{s}", .{ qbittorrent_release, asset });
+    try testing.expect(std.mem.indexOf(u8, command, url) != null);
 }
 
 test "procs: the qBittorrent unit names the profile and the WebUI port" {

@@ -741,6 +741,12 @@ pub const App = struct {
             self.setStatus("HOME не задан — некуда ставить qBittorrent", .err);
             return;
         }
+        // The release publishes one file per architecture; a build of ziggurat
+        // for a target the client does not ship has nothing to install.
+        const asset = procs.qbittorrent_asset orelse {
+            self.setStatus("для этой архитектуры сборки qBittorrent-nox нет", .err);
+            return;
+        };
         self.link_selected = false;
 
         // The Torrents directory is created first: the absolute path it yields
@@ -813,7 +819,7 @@ pub const App = struct {
         };
 
         var cmd_buf: [4096]u8 = undefined;
-        const command = try procs.qbittorrentCommand(&cmd_buf, self.options.home);
+        const command = try procs.qbittorrentCommand(&cmd_buf, self.options.home, asset);
         const dir = std.fs.path.dirname(self.config.cache) orelse ".";
         var log_buf: [512]u8 = undefined;
         const log_path = std.fmt.bufPrint(&log_buf, "{s}/qbittorrent-install.log", .{dir}) catch {

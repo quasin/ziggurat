@@ -119,7 +119,8 @@ either way — it is tens of gigabytes.
 ## The qBittorrent shortcut
 
 The `Install qBittorrent-nox` shortcut under the source line puts the static
-headless client into `~/.local/bin`, creates the Torrents directory (`--torrents`,
+headless client into `~/.local/bin` — the build matching the architecture
+ziggurat itself was compiled for (`x86_64`, `aarch64` or `riscv64`), creates the Torrents directory (`--torrents`,
 `Torrents` beside `mnt/` by default), points the client's default save path at
 it, and installs a systemd user service that keeps it running:
 

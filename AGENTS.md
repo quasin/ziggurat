@@ -193,7 +193,11 @@ Running the interface needs `rekarma` (itself built with libfuse3) and
   `<profile>/qBittorrent/config/qBittorrent.conf`), not `--save-path`, which only
   applies to torrents passed to qBittorrent at startup. Complete releases go to
   the `--torrents` directory (`Torrents` beside `mnt/`), which is created when
-  the shortcut runs; the mounts stay read-only and are never touched.
+  the shortcut runs; the mounts stay read-only and are never touched. The
+  download is the release asset of the compiled-in architecture
+  (`builtin.cpu.arch` → `x86_64-…`, `aarch64-…`, `riscv64-…`; any other target
+  compiles but the shortcut refuses, so one optional installer never breaks a
+  build).
 - **Inside `[WebUI]` the config keys are bare.** qBittorrent reads
   `WebUI/Password_PBKDF2`, so the line under the `[WebUI]` heading is
   `Password_PBKDF2="@ByteArray(salt:key)"` and `Username=admin`; writing
