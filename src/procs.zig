@@ -287,7 +287,7 @@ pub const ant_client_url = "https://raw.githubusercontent.com/WithAutonomi/ant-c
 pub const qbittorrent_url = "https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-5.3.0_v2.1.2/x86_64-qbittorrent-nox";
 
 /// The port the WebUI of ziggurat's qBittorrent answers on.
-pub const qbittorrent_webui_port: u16 = 8080;
+pub const qbittorrent_webui_port: u16 = 8090;
 
 /// The RuTracker database source. The address is fixed, the archive has the
 /// upstream name, and `xz -d` turns it into the `.xml` beside it.
@@ -710,7 +710,7 @@ test "procs: the qBittorrent unit names the profile and the WebUI port" {
     try testing.expect(std.mem.indexOf(
         u8,
         unit,
-        "ExecStart=\"/home/u/.local/bin/qbittorrent-nox\" --profile=\"/home/u/.config/ziggurat/qbittorrent\" --webui-port=8080",
+        "ExecStart=\"/home/u/.local/bin/qbittorrent-nox\" --profile=\"/home/u/.config/ziggurat/qbittorrent\" --webui-port=8090",
     ) != null);
     try testing.expect(std.mem.indexOf(u8, unit, "WantedBy=default.target") != null);
 }

@@ -1333,7 +1333,11 @@ pub const App = struct {
                 // systemctl failing is a service that is not up, and saying
                 // otherwise would hide it behind a log the panel never shows.
                 if (code == 0) {
-                    self.setStatus("qBittorrent-nox установлен · служба запущена · WebUI :8080", .ok);
+                    var done: [160]u8 = undefined;
+                    const text = std.fmt.bufPrint(&done, "qBittorrent-nox установлен · служба запущена · WebUI :{d}", .{
+                        procs.qbittorrent_webui_port,
+                    }) catch "qBittorrent-nox установлен · служба запущена";
+                    self.setStatus(text, .ok);
                 } else {
                     var buf: [240]u8 = undefined;
                     const text = std.fmt.bufPrint(&buf, "qBittorrent-nox: установка не удалась (код {d}) — смотрите qbittorrent-install.log", .{code}) catch "";

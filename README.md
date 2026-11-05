@@ -126,7 +126,7 @@ it, and installs a systemd user service that keeps it running:
     systemctl --user status qbittorrent-nox
     journalctl --user -u qbittorrent-nox      # the temporary WebUI password
 
-The WebUI answers on http://localhost:8080. The service runs its own qBittorrent
+The WebUI answers on http://localhost:8090. The service runs its own qBittorrent
 profile in `~/.config/ziggurat/qbittorrent`, so it never reads or rewrites a
 qBittorrent the user already runs. Complete releases land in the Torrents
 directory; the mounts stay read-only and are never touched — a download in them
