@@ -67,11 +67,13 @@ file, so it can be browsed with no peer at all. Quote a link in a shell: `?` and
 
     mnt/<first 8 of the info-hash>/      the release, read-only, while mounted
     mnt/<digest of the path>/            the same, for a .torrent source
+    Torrents/                            complete releases (qBittorrent's save path)
     .ziggurat/cache/<hash>/magnet.log    the mount daemon's own log
     .ziggurat/cache/<hash>/magnet.pid    its pid: kill $(cat …) stops it
     .ziggurat/history.tsv                the history (magnet, mount, title)
 
-`--mount-root`, `--cache`, `--history`, `--rekarma` and `--open` move all of it.
+`--mount-root`, `--torrents`, `--cache`, `--history`, `--rekarma` and `--open`
+move all of it.
 A mount that never produces metadata is reported as `ошибка` after three
 minutes, with the last line of the daemon's log as the reason.
 
@@ -113,6 +115,22 @@ build scans several times slower). Matches are listed newest first: the scan
 sorts them by the release date once it ends, so a row that appears mid-scan can
 still move. `rutracker-*.xml` is listed in `.gitignore`
 either way — it is tens of gigabytes.
+
+## The qBittorrent shortcut
+
+The `Install qBittorrent-nox` shortcut under the source line puts the static
+headless client into `~/.local/bin`, creates the Torrents directory (`--torrents`,
+`Torrents` beside `mnt/` by default), points the client's default save path at
+it, and installs a systemd user service that keeps it running:
+
+    systemctl --user status qbittorrent-nox
+    journalctl --user -u qbittorrent-nox      # the temporary WebUI password
+
+The WebUI answers on http://localhost:8080. The service runs its own qBittorrent
+profile in `~/.config/ziggurat/qbittorrent`, so it never reads or rewrites a
+qBittorrent the user already runs. Complete releases land in the Torrents
+directory; the mounts stay read-only and are never touched — a download in them
+would fight the FUSE server.
 
 ## License
 

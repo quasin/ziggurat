@@ -51,7 +51,8 @@ pub const usage =
     \\  are what pull the pieces out of the swarm.
     \\
     \\  `↓` selects the shortcuts under the source line: the ant-client installer,
-    \\  the RuTracker.Org database download and its viewer, and the reKarma room.
+    \\  the qBittorrent-nox installer and service, the RuTracker.Org database
+    \\  download and its viewer, and the reKarma room.
     \\  The viewer searches rutracker-*.xml from the startup directory and mounts
     \\  the release of a chosen match.
     \\
@@ -62,6 +63,7 @@ pub const usage =
     \\  --rekarma <path>    binary that mounts a release          [rekarma]
     \\  --open <path>       opener for a release's files         [xdg-open]
     \\  --mount-root <dir>  where releases are mounted           [mnt]
+    \\  --torrents <dir>    where complete releases are kept     [Torrents]
     \\  --cache <dir>       where pieces and logs are kept       [.ziggurat/cache]
     \\  --history <path>    history file                         [.ziggurat/history.tsv]
     \\
@@ -80,13 +82,14 @@ pub const usage =
     \\
 ;
 
-const Field = enum { rekarma, opener, mount_root, cache, history };
+const Field = enum { rekarma, opener, mount_root, torrents, cache, history };
 const Flag = struct { name: []const u8, field: Field };
 
 const flags = [_]Flag{
     .{ .name = "--rekarma", .field = .rekarma },
     .{ .name = "--open", .field = .opener },
     .{ .name = "--mount-root", .field = .mount_root },
+    .{ .name = "--torrents", .field = .torrents },
     .{ .name = "--cache", .field = .cache },
     .{ .name = "--history", .field = .history },
 };
@@ -113,6 +116,7 @@ pub fn parse(args: []const []const u8) Command {
                         .rekarma => options.config.rekarma = value,
                         .opener => options.config.opener = value,
                         .mount_root => options.config.mount_root = value,
+                        .torrents => options.config.torrents = value,
                         .cache => options.config.cache = value,
                         .history => options.history_path = value,
                     }
@@ -208,6 +212,7 @@ fn run(init: std.process.Init) !void {
     const out = &stdout_file_writer.interface;
 
     const path_var = init.environ_map.get("PATH");
+    const home = init.environ_map.get("HOME") orelse "";
     var rekarma_ver_buf: [64]u8 = undefined;
     var librats_ver_buf: [64]u8 = undefined;
 
@@ -260,6 +265,7 @@ fn run(init: std.process.Init) !void {
                 .history_path = options.history_path,
                 .rekarma_exe = rekarma_exe,
                 .opener_exe = opener_exe,
+                .home = home,
                 .ant_exe = ant_exe,
                 .xz_exe = xz_exe,
             });

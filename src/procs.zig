@@ -18,6 +18,10 @@ pub const Config = struct {
     /// Where pieces and the daemon's log/pid are kept:
     /// <cache>/<8-char hash>/{magnet.log,magnet.pid}.
     cache: []const u8 = ".ziggurat/cache",
+    /// Where complete releases are kept — qBittorrent's save path. A directory
+    /// of its own, never the mount root: the mounted releases are the reader's,
+    /// and a download landing in them would fight the FUSE server.
+    torrents: []const u8 = "Torrents",
 };
 
 /// Where a program name actually lives, or null when it is nowhere.
@@ -278,6 +282,13 @@ pub fn reapIfDone(pid: std.posix.pid_t) bool {
 
 pub const ant_client_url = "https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh";
 
+/// The static build of qBittorrent's headless client: one file, no package
+/// manager, and the version the service runs is exactly the one named here.
+pub const qbittorrent_url = "https://github.com/userdocs/qbittorrent-nox-static/releases/download/release-5.3.0_v2.1.2/x86_64-qbittorrent-nox";
+
+/// The port the WebUI of ziggurat's qBittorrent answers on.
+pub const qbittorrent_webui_port: u16 = 8080;
+
 /// The RuTracker database source. The address is fixed, the archive has the
 /// upstream name, and `xz -d` turns it into the `.xml` beside it.
 pub const rutracker_address = "a74d01ff38a9a737cc009f54ae4bf4f0b03c446aa61e1c1d11fff5c6f6df06fc";
@@ -321,6 +332,141 @@ pub fn installAutonomi(io: Io, dir: []const u8, log_path: []const u8) !std.posix
     var cmd_buf: [2048]u8 = undefined;
     const command = try antClientCommand(&cmd_buf);
     return runInBackground(io, command, dir, log_path);
+}
+
+/// The profile ziggurat gives qBittorrent: a directory of its own, so the
+/// service never reads or rewrites a qBittorrent the user may already run.
+pub fn qbittorrentProfile(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ home, ".config/ziggurat/qbittorrent" });
+}
+
+/// Where qBittorrent keeps its settings under that profile. A `--profile=<dir>`
+/// run stores them in `<dir>/qBittorrent/config/qBittorrent.conf`.
+pub fn qbittorrentConfigPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ home, ".config/ziggurat/qbittorrent/qBittorrent/config/qBittorrent.conf" });
+}
+
+/// Downloads the static build into `~/.local/bin` and (re)starts the user unit:
+/// the unit and the profile config are already written by ziggurat, so the job
+/// here is the file and the service manager. `.new` plus `mv` keeps a running
+/// binary from being replaced mid-read.
+pub fn qbittorrentCommand(buf: []u8, home: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "mkdir -p \"{s}/.local/bin\" && curl -fsSL {s} -o \"{s}/.local/bin/qbittorrent-nox.new\" && " ++
+            "chmod +x \"{s}/.local/bin/qbittorrent-nox.new\" && " ++
+            "mv -f \"{s}/.local/bin/qbittorrent-nox.new\" \"{s}/.local/bin/qbittorrent-nox\" && " ++
+            "systemctl --user daemon-reload && systemctl --user enable --now qbittorrent-nox.service",
+        .{ home, qbittorrent_url, home, home, home, home },
+    );
+}
+
+/// The user service that keeps the client up after the interface exits. The
+/// paths are literal because the home is known here; the WebUI port is fixed so
+/// the panel can name it.
+pub fn qbittorrentUnit(buf: []u8, home: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf,
+        \\[Unit]
+        \\Description=qBittorrent-nox (ziggurat)
+        \\Wants=network-online.target
+        \\After=network-online.target nss-lookup.target
+        \\
+        \\[Service]
+        \\Type=exec
+        \\ExecStart="{s}/.local/bin/qbittorrent-nox" --profile="{s}/.config/ziggurat/qbittorrent" --webui-port={d}
+        \\Restart=on-failure
+        \\SyslogIdentifier=qbittorrent-nox
+        \\
+        \\[Install]
+        \\WantedBy=default.target
+        \\
+    , .{ home, home, qbittorrent_webui_port });
+}
+
+pub const qbittorrent_save_path_key = "Session\\DefaultSavePath=";
+
+/// Points qBittorrent's default save path at `save_path`. It is a preference,
+/// not a switch — `--save-path` only applies to torrents handed to it at
+/// startup — so the profile's config is edited: created when absent, and only
+/// that one key replaced when the client has already written its own settings
+/// into it, because a WebUI password or a port must survive a reinstall.
+pub fn setDefaultSavePath(io: Io, allocator: std.mem.Allocator, config_path: []const u8, save_path: []const u8) !void {
+    var existing: []u8 = &.{};
+    var owned = false;
+    if (std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(1 << 20))) |data| {
+        existing = data;
+        owned = true;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    defer if (owned) allocator.free(existing);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    // Whether the file already carries the key decides where it goes: a file
+    // without it gets the line under the section header (or a section of its
+    // own), a file with it only has that line rewritten.
+    var has_key = false;
+    var key_scan = std.mem.splitScalar(u8, existing, '\n');
+    while (key_scan.next()) |line| {
+        if (std.mem.startsWith(u8, std.mem.trimEnd(u8, line, "\r"), qbittorrent_save_path_key)) {
+            has_key = true;
+            break;
+        }
+    }
+
+    var replaced = false;
+    var first = true;
+    var lines = std.mem.splitScalar(u8, existing, '\n');
+    while (lines.next()) |line| {
+        const bare = std.mem.trimEnd(u8, line, "\r");
+        if (!first) try out.append(allocator, '\n');
+        first = false;
+
+        if (std.mem.eql(u8, bare, "[BitTorrent]")) {
+            try out.appendSlice(allocator, line);
+            if (!has_key) {
+                try out.append(allocator, '\n');
+                try appendSavePath(allocator, &out, save_path);
+                replaced = true;
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, bare, qbittorrent_save_path_key)) {
+            try appendSavePath(allocator, &out, save_path);
+            replaced = true;
+            continue;
+        }
+        try out.appendSlice(allocator, line);
+    }
+
+    if (!replaced) {
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+        try out.appendSlice(allocator, "[BitTorrent]\n");
+        try appendSavePath(allocator, &out, save_path);
+        try out.append(allocator, '\n');
+    }
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = out.items });
+}
+
+fn appendSavePath(allocator: std.mem.Allocator, out: *std.ArrayList(u8), save_path: []const u8) !void {
+    try out.appendSlice(allocator, qbittorrent_save_path_key);
+    try out.appendSlice(allocator, save_path);
+}
+
+/// The path made absolute against the directory the program runs in: a
+/// qBittorrent preference must be absolute, while `--torrents Torrents` reads
+/// naturally as "beside mnt/".
+pub fn absolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rc = linux.getcwd(&buf, buf.len);
+    if (linux.errno(rc) != .SUCCESS or rc == 0) return error.CwdUnavailable;
+    // The syscall answers the length including the terminating NUL.
+    return std.fs.path.join(allocator, &.{ buf[0 .. rc - 1], path });
 }
 
 pub const ToolVersions = struct {
@@ -522,6 +668,64 @@ test "procs: a mount is running only while its pid file names a live process" {
     // gets checked, not the file.
     try tmp.dir.writeFile(io, .{ .sub_path = "magnet.pid", .data = "999999999" });
     try testing.expect(!mountRunning(io, cache));
+}
+
+test "procs: the qBittorrent config keeps every other setting" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/qBittorrent.conf", .{tmp.sub_path});
+
+    // A fresh profile gets the section and the key.
+    try setDefaultSavePath(io, a, path, "/data/Torrents");
+    var buf: [4096]u8 = undefined;
+    var text = try std.Io.Dir.cwd().readFile(io, path, &buf);
+    try testing.expectEqualStrings("[BitTorrent]\nSession\\DefaultSavePath=/data/Torrents\n", text);
+
+    // A file the client already filled in keeps its keys; only ours changes.
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = "[BitTorrent]\nSession\\Port=16881\nSession\\DefaultSavePath=/old\n\n[WebUI]\nPort=8080\n",
+    });
+    try setDefaultSavePath(io, a, path, "/new");
+    text = try std.Io.Dir.cwd().readFile(io, path, &buf);
+    try testing.expectEqualStrings(
+        "[BitTorrent]\nSession\\Port=16881\nSession\\DefaultSavePath=/new\n\n[WebUI]\nPort=8080\n",
+        text,
+    );
+
+    // A section without the key gets it right under the header.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "[BitTorrent]\nSession\\Port=1\n" });
+    try setDefaultSavePath(io, a, path, "/x");
+    text = try std.Io.Dir.cwd().readFile(io, path, &buf);
+    try testing.expectEqualStrings("[BitTorrent]\nSession\\DefaultSavePath=/x\nSession\\Port=1\n", text);
+}
+
+test "procs: the qBittorrent unit names the profile and the WebUI port" {
+    var buf: [2048]u8 = undefined;
+    const unit = try qbittorrentUnit(&buf, "/home/u");
+    try testing.expect(std.mem.indexOf(
+        u8,
+        unit,
+        "ExecStart=\"/home/u/.local/bin/qbittorrent-nox\" --profile=\"/home/u/.config/ziggurat/qbittorrent\" --webui-port=8080",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, unit, "WantedBy=default.target") != null);
+}
+
+test "procs: a relative Torrents path is made absolute" {
+    const a = testing.allocator;
+
+    const absolute = try absolutePath(a, "/data/Torrents");
+    defer a.free(absolute);
+    try testing.expectEqualStrings("/data/Torrents", absolute);
+
+    const relative = try absolutePath(a, "Torrents");
+    defer a.free(relative);
+    try testing.expect(std.fs.path.isAbsolute(relative));
+    try testing.expect(std.mem.endsWith(u8, relative, "/Torrents"));
 }
 
 test "procs: a program is found on PATH or not at all" {

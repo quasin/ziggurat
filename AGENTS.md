@@ -38,7 +38,7 @@ Running the interface needs `rekarma` (itself built with libfuse3) and
     src/term.zig                 raw mode, key decoding, frame buffer (clipped, styled text)
     src/procs.zig                spawning rekarma/player, mount probing, file scan, log tail,
                                  rekarma version lookup, background installers (ant-client,
-                                 the RuTracker database)
+                                 qBittorrent-nox, the RuTracker database)
     src/rutracker.zig            the RuTracker dump: streaming search, record parsing, the
                                  worker thread behind the viewer
     src/history.zig              the history rows and their tab-separated file
@@ -185,6 +185,15 @@ Running the interface needs `rekarma` (itself built with libfuse3) and
   startup state and Enter check `procs.mountRunning` (`/proc/<pid>` for the pid
   in the file) and adopt the daemon that is already working instead of spawning
   a twin over its pid.
+- **The qBittorrent service has its own profile, and never the mount root.** The
+  shortcut writes `~/.config/systemd/user/qbittorrent-nox.service` and a profile
+  under `~/.config/ziggurat/qbittorrent`, and a reinstall rewrites only that one
+  unit and one config key — a WebUI password or a port must survive it. The save
+  path is a preference (`Session\DefaultSavePath=` in
+  `<profile>/qBittorrent/config/qBittorrent.conf`), not `--save-path`, which only
+  applies to torrents passed to qBittorrent at startup. Complete releases go to
+  the `--torrents` directory (`Torrents` beside `mnt/`), which is created when
+  the shortcut runs; the mounts stay read-only and are never touched.
 - **Ctrl-C must reach the program as a keypress** (`ISIG` off in raw mode), or
   the terminal is left in raw mode and the alternate screen after a signal.
   Every exit path restores both, and the mounts deliberately survive the exit —

@@ -78,9 +78,10 @@ const Link = struct {
     label: []const u8,
     action: Action,
 };
-const Action = enum { autonomi_install, rutracker_database, rutracker_view, room_history };
+const Action = enum { autonomi_install, qbittorrent_install, rutracker_database, rutracker_view, room_history };
 const links = [_]Link{
     .{ .label = "Autonomi Install", .action = .autonomi_install },
+    .{ .label = "Install qBittorrent-nox", .action = .qbittorrent_install },
     .{ .label = "Install RuTracker.Org DataBase", .action = .rutracker_database },
     .{ .label = "База RuTracker.Org", .action = .rutracker_view },
     .{ .label = "История reKarma", .action = .room_history },
@@ -116,6 +117,10 @@ pub const Options = struct {
     /// manager. The mount is a plain directory to whatever the desktop
     /// associates with the type.
     opener_exe: ?[]const u8 = null,
+    /// `$HOME` as the process saw it: the qBittorrent binary, its profile and
+    /// its user unit all live under it. Empty when the environment has none,
+    /// and then the installer refuses instead of writing to "/.local".
+    home: []const u8 = "",
     /// The two tools behind the RuTracker database link: `ant` fetches the
     /// archive, `xz -d` unpacks it in place.
     ant_exe: ?[]const u8 = null,
@@ -210,6 +215,9 @@ pub const App = struct {
     /// The installer runs far longer than a player, so its pid stays here
     /// until `reapIfDone` sees it exit instead of being dropped after one poll.
     install_pid: ?std.posix.pid_t = null,
+    /// The qBittorrent download and service start; same contract as the
+    /// installer above.
+    qbittorrent_pid: ?std.posix.pid_t = null,
     /// The RuTracker database download/unpack, reaped the same way.
     download_pid: ?std.posix.pid_t = null,
     tick: u64 = 0,
@@ -716,10 +724,100 @@ pub const App = struct {
     fn runLink(self: *App) !void {
         switch (links[self.link_index].action) {
             .autonomi_install => try self.installAutonomi(),
+            .qbittorrent_install => try self.installQbittorrent(),
             .rutracker_database => try self.downloadRutrackerDatabase(),
             .rutracker_view => try self.openDatabase(),
             .room_history => try self.openRoom(),
         }
+    }
+
+    /// Enter on the qBittorrent shortcut: the headless client lands in
+    /// `~/.local/bin`, its own profile points at the Torrents directory, and a
+    /// user service keeps it up. The 72 MB download is the background job; the
+    /// profile and the unit are tiny and written here, before it starts, so the
+    /// service never comes up with a default save path.
+    fn installQbittorrent(self: *App) !void {
+        if (self.options.home.len == 0) {
+            self.setStatus("HOME не задан — некуда ставить qBittorrent", .err);
+            return;
+        }
+        self.link_selected = false;
+
+        // The Torrents directory is created first: the absolute path it yields
+        // is what qBittorrent stores, and `--torrents` may be relative. The
+        // mount root is never touched — these are complete releases, not the
+        // read-only mounts the panel reads through.
+        const torrents = procs.absolutePath(self.allocator, self.config.torrents) catch |err| {
+            var buf: [200]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "не удалось определить путь Torrents: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+        defer self.allocator.free(torrents);
+        std.Io.Dir.cwd().createDirPath(self.io, torrents) catch |err| {
+            var buf: [240]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "не удалось создать {s}: {s}", .{ torrents, @errorName(err) }) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+
+        const profile = try procs.qbittorrentProfile(self.allocator, self.options.home);
+        defer self.allocator.free(profile);
+        const config_path = try procs.qbittorrentConfigPath(self.allocator, self.options.home);
+        defer self.allocator.free(config_path);
+        std.Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(config_path) orelse profile) catch |err| {
+            var buf: [240]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "не удалось создать каталог профиля: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+        procs.setDefaultSavePath(self.io, self.allocator, config_path, torrents) catch |err| {
+            var buf: [240]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "не удалось записать настройки qBittorrent: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+
+        const unit_path = try std.fs.path.join(self.allocator, &.{ self.options.home, ".config/systemd/user/qbittorrent-nox.service" });
+        defer self.allocator.free(unit_path);
+        std.Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(unit_path) orelse ".") catch |err| {
+            var buf: [240]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "не удалось создать каталог службы: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+        var unit_buf: [2048]u8 = undefined;
+        const unit = try procs.qbittorrentUnit(&unit_buf, self.options.home);
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = unit_path, .data = unit }) catch |err| {
+            var buf: [240]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "не удалось записать службу: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+
+        var cmd_buf: [4096]u8 = undefined;
+        const command = try procs.qbittorrentCommand(&cmd_buf, self.options.home);
+        const dir = std.fs.path.dirname(self.config.cache) orelse ".";
+        var log_buf: [512]u8 = undefined;
+        const log_path = std.fmt.bufPrint(&log_buf, "{s}/qbittorrent-install.log", .{dir}) catch {
+            self.setStatus("не удалось собрать путь к логу установщика", .err);
+            return;
+        };
+        const pid = procs.runInBackground(self.io, command, dir, log_path) catch |err| {
+            var buf: [200]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "установщик qBittorrent: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+        self.qbittorrent_pid = pid;
+
+        var buf: [300]u8 = undefined;
+        const text = std.fmt.bufPrint(
+            &buf,
+            "qBittorrent-nox: загрузка в ~/.local/bin · полные раздачи: {s} · WebUI :{d} · лог: {s}",
+            .{ torrents, procs.qbittorrent_webui_port, log_path },
+        ) catch "qBittorrent-nox: установка запущена";
+        self.setStatus(text, .ok);
     }
 
     /// Enter on the dump shortcut: the right panel becomes the searchable
@@ -1226,6 +1324,21 @@ pub const App = struct {
             if (procs.reapIfDone(pid)) {
                 self.install_pid = null;
                 self.setStatus("установщик ant-client завершён", .ok);
+            }
+        }
+        if (self.qbittorrent_pid) |pid| {
+            if (procs.reapCode(pid)) |code| {
+                self.qbittorrent_pid = null;
+                // Unlike the installer above, the answer matters here: curl or
+                // systemctl failing is a service that is not up, and saying
+                // otherwise would hide it behind a log the panel never shows.
+                if (code == 0) {
+                    self.setStatus("qBittorrent-nox установлен · служба запущена · WebUI :8080", .ok);
+                } else {
+                    var buf: [240]u8 = undefined;
+                    const text = std.fmt.bufPrint(&buf, "qBittorrent-nox: установка не удалась (код {d}) — смотрите qbittorrent-install.log", .{code}) catch "";
+                    self.setStatus(text, .err);
+                }
             }
         }
         if (self.download_pid) |pid| {
