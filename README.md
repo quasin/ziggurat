@@ -124,9 +124,11 @@ headless client into `~/.local/bin`, creates the Torrents directory (`--torrents
 it, and installs a systemd user service that keeps it running:
 
     systemctl --user status qbittorrent-nox
-    journalctl --user -u qbittorrent-nox      # the temporary WebUI password
+    journalctl --user -u qbittorrent-nox      # the service's own log
 
-The WebUI answers on http://localhost:8090. The service runs its own qBittorrent
+The WebUI answers on http://localhost:8090 with the account `admin` / `ziggurat`
+on a fresh profile; a password changed in the WebUI is kept when the shortcut is
+pressed again. The service runs its own qBittorrent
 profile in `~/.config/ziggurat/qbittorrent`, so it never reads or rewrites a
 qBittorrent the user already runs. Complete releases land in the Torrents
 directory; the mounts stay read-only and are never touched — a download in them

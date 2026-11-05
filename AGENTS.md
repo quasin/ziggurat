@@ -194,6 +194,14 @@ Running the interface needs `rekarma` (itself built with libfuse3) and
   applies to torrents passed to qBittorrent at startup. Complete releases go to
   the `--torrents` directory (`Torrents` beside `mnt/`), which is created when
   the shortcut runs; the mounts stay read-only and are never touched.
+- **Inside `[WebUI]` the config keys are bare.** qBittorrent reads
+  `WebUI/Password_PBKDF2`, so the line under the `[WebUI]` heading is
+  `Password_PBKDF2="@ByteArray(salt:key)"` and `Username=admin`; writing
+  `WebUI\Password_PBKDF2` under that heading resolves to
+  `WebUI/WebUI/Password_PBKDF2` and is silently ignored — the client then logs
+  in with a one-time password instead. The value is PBKDF2-HMAC-SHA512,
+  100000 rounds, 16 bytes of salt and 64 of key, both base64 in one
+  `@ByteArray(salt:key)`; `--save-path` plays no part in it either.
 - **Ctrl-C must reach the program as a keypress** (`ISIG` off in raw mode), or
   the terminal is left in raw mode and the alternate screen after a signal.
   Every exit path restores both, and the mounts deliberately survive the exit —

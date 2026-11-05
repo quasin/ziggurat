@@ -778,6 +778,23 @@ pub const App = struct {
             return;
         };
 
+        // A default WebUI account, so a fresh install is reachable without
+        // digging the one-time password out of the journal. A password already
+        // changed in the WebUI is left alone.
+        const hash = procs.qbittorrentPasswordHash(self.io, self.allocator, procs.qbittorrent_password) catch |err| {
+            var buf: [240]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "не удалось захешировать пароль qBittorrent: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+        defer self.allocator.free(hash);
+        procs.setWebUiAccount(self.io, self.allocator, config_path, procs.qbittorrent_username, hash) catch |err| {
+            var buf: [240]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "не удалось записать логин qBittorrent: {s}", .{@errorName(err)}) catch "";
+            self.setStatus(text, .err);
+            return;
+        };
+
         const unit_path = try std.fs.path.join(self.allocator, &.{ self.options.home, ".config/systemd/user/qbittorrent-nox.service" });
         defer self.allocator.free(unit_path);
         std.Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(unit_path) orelse ".") catch |err| {

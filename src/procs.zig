@@ -384,13 +384,65 @@ pub fn qbittorrentUnit(buf: []u8, home: []const u8) ![]const u8 {
 }
 
 pub const qbittorrent_save_path_key = "Session\\DefaultSavePath=";
+pub const qbittorrent_username = "admin";
+pub const qbittorrent_password = "ziggurat";
+
+/// The `@ByteArray(salt:key)` value qBittorrent keeps under
+/// `WebUI\Password_PBKDF2`: 16 bytes of salt and PBKDF2-HMAC-SHA512, 100000
+/// rounds, 64 bytes of key — the constants the client itself verifies with.
+/// Both halves are standard base64, salt first, joined by a colon.
+pub fn qbittorrentPasswordHash(io: Io, allocator: std.mem.Allocator, password: []const u8) ![]u8 {
+    var salt: [16]u8 = undefined;
+    io.random(&salt);
+    var key: [64]u8 = undefined;
+    try std.crypto.pwhash.pbkdf2(&key, password, &salt, 100_000, std.crypto.auth.hmac.sha2.HmacSha512);
+
+    var salt_buf: [24]u8 = undefined; // base64 of 16 bytes
+    var key_buf: [88]u8 = undefined; // base64 of 64 bytes
+    const salt_text = std.base64.standard.Encoder.encode(&salt_buf, &salt);
+    const key_text = std.base64.standard.Encoder.encode(&key_buf, &key);
+    return std.fmt.allocPrint(allocator, "@ByteArray({s}:{s})", .{ salt_text, key_text });
+}
 
 /// Points qBittorrent's default save path at `save_path`. It is a preference,
 /// not a switch — `--save-path` only applies to torrents handed to it at
-/// startup — so the profile's config is edited: created when absent, and only
-/// that one key replaced when the client has already written its own settings
-/// into it, because a WebUI password or a port must survive a reinstall.
+/// startup — so the profile's config is edited instead.
 pub fn setDefaultSavePath(io: Io, allocator: std.mem.Allocator, config_path: []const u8, save_path: []const u8) !void {
+    return upsertConfigKey(io, allocator, config_path, "[BitTorrent]", qbittorrent_save_path_key, save_path, false);
+}
+
+/// The WebUI account the service starts with. Both keys are written only when
+/// the file does not have them: a password the user changed in the WebUI must
+/// survive the next press of the shortcut.
+pub fn setWebUiAccount(
+    io: Io,
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+    username: []const u8,
+    password_hash: []const u8,
+) !void {
+    var quoted_buf: [256]u8 = undefined;
+    const quoted = try std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{password_hash});
+    // Inside `[WebUI]` the keys are bare: qBittorrent reads
+    // `WebUI/Password_PBKDF2`, and a `WebUI\` prefix under the same section
+    // would resolve to `WebUI/WebUI/...` and be ignored.
+    try upsertConfigKey(io, allocator, config_path, "[WebUI]", "Username=", username, true);
+    try upsertConfigKey(io, allocator, config_path, "[WebUI]", "Password_PBKDF2=", quoted, true);
+}
+
+/// Writes one key into a `qBittorrent.conf`: the file is created when absent,
+/// the key is replaced where it already is, and inserted right under its
+/// section header otherwise (a missing section is appended). `keep_existing`
+/// leaves the current value alone when the key is already there.
+pub fn upsertConfigKey(
+    io: Io,
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+    section: []const u8,
+    key: []const u8,
+    value: []const u8,
+    keep_existing: bool,
+) !void {
     var existing: []u8 = &.{};
     var owned = false;
     if (std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(1 << 20))) |data| {
@@ -402,22 +454,20 @@ pub fn setDefaultSavePath(io: Io, allocator: std.mem.Allocator, config_path: []c
     }
     defer if (owned) allocator.free(existing);
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
-    // Whether the file already carries the key decides where it goes: a file
-    // without it gets the line under the section header (or a section of its
-    // own), a file with it only has that line rewritten.
     var has_key = false;
     var key_scan = std.mem.splitScalar(u8, existing, '\n');
     while (key_scan.next()) |line| {
-        if (std.mem.startsWith(u8, std.mem.trimEnd(u8, line, "\r"), qbittorrent_save_path_key)) {
+        if (std.mem.startsWith(u8, std.mem.trimEnd(u8, line, "\r"), key)) {
             has_key = true;
             break;
         }
     }
+    if (has_key and keep_existing) return;
 
-    var replaced = false;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var wrote = false;
     var first = true;
     var lines = std.mem.splitScalar(u8, existing, '\n');
     while (lines.next()) |line| {
@@ -425,36 +475,35 @@ pub fn setDefaultSavePath(io: Io, allocator: std.mem.Allocator, config_path: []c
         if (!first) try out.append(allocator, '\n');
         first = false;
 
-        if (std.mem.eql(u8, bare, "[BitTorrent]")) {
+        if (std.mem.eql(u8, bare, section)) {
             try out.appendSlice(allocator, line);
             if (!has_key) {
                 try out.append(allocator, '\n');
-                try appendSavePath(allocator, &out, save_path);
-                replaced = true;
+                try out.appendSlice(allocator, key);
+                try out.appendSlice(allocator, value);
+                wrote = true;
             }
             continue;
         }
-        if (std.mem.startsWith(u8, bare, qbittorrent_save_path_key)) {
-            try appendSavePath(allocator, &out, save_path);
-            replaced = true;
+        if (std.mem.startsWith(u8, bare, key)) {
+            try out.appendSlice(allocator, key);
+            try out.appendSlice(allocator, value);
+            wrote = true;
             continue;
         }
         try out.appendSlice(allocator, line);
     }
 
-    if (!replaced) {
+    if (!wrote) {
         if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
-        try out.appendSlice(allocator, "[BitTorrent]\n");
-        try appendSavePath(allocator, &out, save_path);
+        try out.appendSlice(allocator, section);
+        try out.append(allocator, '\n');
+        try out.appendSlice(allocator, key);
+        try out.appendSlice(allocator, value);
         try out.append(allocator, '\n');
     }
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = out.items });
-}
-
-fn appendSavePath(allocator: std.mem.Allocator, out: *std.ArrayList(u8), save_path: []const u8) !void {
-    try out.appendSlice(allocator, qbittorrent_save_path_key);
-    try out.appendSlice(allocator, save_path);
 }
 
 /// The path made absolute against the directory the program runs in: a
@@ -702,6 +751,63 @@ test "procs: the qBittorrent config keeps every other setting" {
     try setDefaultSavePath(io, a, path, "/x");
     text = try std.Io.Dir.cwd().readFile(io, path, &buf);
     try testing.expectEqualStrings("[BitTorrent]\nSession\\DefaultSavePath=/x\nSession\\Port=1\n", text);
+}
+
+test "procs: the qBittorrent password hash is PBKDF2 the client can verify" {
+    const a = testing.allocator;
+    const hash = try qbittorrentPasswordHash(std.testing.io, a, "ziggurat");
+    defer a.free(hash);
+
+    try testing.expect(std.mem.startsWith(u8, hash, "@ByteArray("));
+    try testing.expect(std.mem.endsWith(u8, hash, ")"));
+
+    const body = hash["@ByteArray(".len .. hash.len - 1];
+    const colon = std.mem.indexOfScalar(u8, body, ':').?;
+    const salt_text = body[0..colon];
+    const key_text = body[colon + 1 ..];
+    // 16 bytes of salt and 64 bytes of key, base64 with padding.
+    try testing.expectEqual(@as(usize, 24), salt_text.len);
+    try testing.expectEqual(@as(usize, 88), key_text.len);
+
+    var salt: [16]u8 = undefined;
+    var key: [64]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&salt, salt_text);
+    try std.base64.standard.Decoder.decode(&key, key_text);
+
+    var derived: [64]u8 = undefined;
+    try std.crypto.pwhash.pbkdf2(&derived, "ziggurat", &salt, 100_000, std.crypto.auth.hmac.sha2.HmacSha512);
+    try testing.expectEqualSlices(u8, &key, &derived);
+}
+
+test "procs: the WebUI account is written once and then left alone" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/qBittorrent.conf", .{tmp.sub_path});
+
+    try setWebUiAccount(io, a, path, "admin", "@ByteArray(AAAA:BBBB)");
+    var buf: [4096]u8 = undefined;
+    var text = try std.Io.Dir.cwd().readFile(io, path, &buf);
+    try testing.expectEqualStrings(
+        "[WebUI]\nPassword_PBKDF2=\"@ByteArray(AAAA:BBBB)\"\nUsername=admin\n",
+        text,
+    );
+
+    // The password the user changed in the WebUI stays; the missing username
+    // is still filled in.
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = "[WebUI]\nPassword_PBKDF2=\"@ByteArray(CCCC:DDDD)\"\n",
+    });
+    try setWebUiAccount(io, a, path, "admin", "@ByteArray(AAAA:BBBB)");
+    text = try std.Io.Dir.cwd().readFile(io, path, &buf);
+    try testing.expectEqualStrings(
+        "[WebUI]\nUsername=admin\nPassword_PBKDF2=\"@ByteArray(CCCC:DDDD)\"\n",
+        text,
+    );
 }
 
 test "procs: the qBittorrent unit names the profile and the WebUI port" {
