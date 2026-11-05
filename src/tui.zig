@@ -234,10 +234,22 @@ pub const App = struct {
         try app.list.load(io, options.history_path);
         for (app.list.items.items) |entry| {
             // What a previous session left mounted is a fact of the filesystem,
-            // not of the history file: ask the mountpoint.
-            try app.runtime.append(allocator, .{
-                .state = if (procs.isMounted(io, entry.mount)) .mounted else .idle,
-            });
+            // not of the history file: ask the mountpoint. A release whose
+            // daemon is alive but whose directory is still empty is a mount on
+            // its way — a restart of the interface must not read it as idle,
+            // because the next Enter would then start a twin on the same cache
+            // dir and overwrite the pid of the daemon that is working.
+            var state: State = .idle;
+            if (procs.isMounted(io, entry.mount)) {
+                state = .mounted;
+            } else {
+                const dirs = try procs.dirsOf(allocator, config, entry.magnet);
+                const running = procs.mountRunning(io, dirs.cache);
+                allocator.free(dirs.mount);
+                allocator.free(dirs.cache);
+                if (running) state = .mounting;
+            }
+            try app.runtime.append(allocator, .{ .state = state });
         }
 
         if (options.rekarma_exe == null) {
@@ -661,6 +673,10 @@ pub const App = struct {
         self.focus = .history;
         try self.saveHistory();
 
+        // A daemon already holding this release keeps it: the row waits for
+        // the mountpoint instead of a second daemon overwriting the pid.
+        if (self.adoptRunningMount(0, dirs.cache)) return;
+
         procs.mount(self.io, exe, link, dirs.mount, dirs.cache) catch |err| {
             var buf: [200]u8 = undefined;
             const note = std.fmt.bufPrint(&buf, "rekarma: {s}", .{@errorName(err)}) catch "";
@@ -977,13 +993,19 @@ pub const App = struct {
             .mounted => try self.openFiles(index),
             .mounting => self.setStatus("ещё монтируется — метаданные не пришли", .warn),
             .idle, .failed => {
+                const dirs = try procs.dirsOf(self.allocator, self.config, entry.magnet);
+                defer self.allocator.free(dirs.mount);
+                defer self.allocator.free(dirs.cache);
+
+                // A daemon already working this release is the mount, whatever
+                // the timeout wrote on the row: starting a second one would
+                // share the release's cache dir and overwrite its pid.
+                if (self.adoptRunningMount(index, dirs.cache)) return;
+
                 const exe = self.options.rekarma_exe orelse {
                     self.setStatus("rekarma не найден в PATH — укажите --rekarma <путь>", .err);
                     return;
                 };
-                const dirs = try procs.dirsOf(self.allocator, self.config, entry.magnet);
-                defer self.allocator.free(dirs.mount);
-                defer self.allocator.free(dirs.cache);
                 procs.mount(self.io, exe, entry.magnet, dirs.mount, dirs.cache) catch |err| {
                     var buf: [200]u8 = undefined;
                     const note = std.fmt.bufPrint(&buf, "rekarma: {s}", .{@errorName(err)}) catch "";
@@ -998,6 +1020,21 @@ pub const App = struct {
                 self.setStatus("монтирование запущено", .dim);
             },
         }
+    }
+
+    /// Takes over a daemon that is still running a release instead of starting
+    /// a second one: ziggurat restarted while the metadata was on its way, or a
+    /// failed row is retried while its daemon is alive after all. The row waits
+    /// on the mountpoint like any other, and the pid file keeps naming the one
+    /// process that holds the mount.
+    fn adoptRunningMount(self: *App, index: usize, cache_dir: []const u8) bool {
+        if (!procs.mountRunning(self.io, cache_dir)) return false;
+        const rt = &self.runtime.items[index];
+        rt.state = .mounting;
+        rt.started_tick = self.tick;
+        rt.note_len = 0;
+        self.setStatus("монтирование уже идёт — ждём метаданные", .dim);
+        return true;
     }
 
     /// The status a mount that just came up earns: what the release holds. A

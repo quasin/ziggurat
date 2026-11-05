@@ -179,7 +179,12 @@ Running the interface needs `rekarma` (itself built with libfuse3) and
   is never a bare "смонтирован".
 - **A daemon per release needs its own cache dir**, `<cache>/<hash>`: rekarma
   writes `magnet.pid`/`magnet.log` into `--cache`, so two releases sharing one
-  directory would overwrite each other's pid and stop the wrong mount.
+  directory would overwrite each other's pid and stop the wrong mount. The same
+  pid file is what keeps a *second* daemon off one release: a restart while the
+  metadata was still coming reads the empty mountpoint as idle, so both the
+  startup state and Enter check `procs.mountRunning` (`/proc/<pid>` for the pid
+  in the file) and adopt the daemon that is already working instead of spawning
+  a twin over its pid.
 - **Ctrl-C must reach the program as a keypress** (`ISIG` off in raw mode), or
   the terminal is left in raw mode and the alternate screen after a signal.
   Every exit path restores both, and the mounts deliberately survive the exit —

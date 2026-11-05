@@ -110,6 +110,23 @@ pub fn unmount(io: Io, cache_dir: []const u8) bool {
     return true;
 }
 
+/// Whether a mount daemon for this release is still alive: `<cache>/magnet.pid`
+/// names it and `/proc/<pid>` says the number is still a process. The pid file
+/// outlives a daemon that exited or was killed, so the file alone proves
+/// nothing — this is the check that keeps a second daemon off the same release.
+pub fn mountRunning(io: Io, cache_dir: []const u8) bool {
+    const pid = readPid(io, cache_dir) orelse return false;
+    return pidAlive(io, pid);
+}
+
+/// `/proc/<pid>` exists for as long as the pid is a process, whatever it does.
+fn pidAlive(io: Io, pid: std.posix.pid_t) bool {
+    var buf: [48]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "/proc/{d}", .{pid}) catch return false;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
 fn readPid(io: Io, cache_dir: []const u8) ?std.posix.pid_t {
     var buf: [64]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/magnet.pid", .{cache_dir}) catch return null;
@@ -144,10 +161,7 @@ pub const room_log_file = "all.txt.log";
 /// spawn anything.
 pub fn recorderRunning(io: Io) bool {
     const pid = readPidFile(io, room_pid_file) orelse return false;
-    var buf: [48]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf, "/proc/{d}", .{pid}) catch return false;
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
+    return pidAlive(io, pid);
 }
 
 /// Starts `rekarma --daemon` with no other argument: the recorder of the default
@@ -485,6 +499,29 @@ test "procs: one release, one mount dir and one cache dir" {
 
     try testing.expectEqualStrings("mnt/81db4118", dirs.mount);
     try testing.expectEqualStrings(".ziggurat/cache/81db4118", dirs.cache);
+}
+
+test "procs: a mount is running only while its pid file names a live process" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buf: [128]u8 = undefined;
+    const cache = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    // No daemon ever wrote a pid here.
+    try testing.expect(!mountRunning(io, cache));
+
+    // A pid file naming this very process is a daemon that is still around.
+    var pid_buf: [32]u8 = undefined;
+    const mine = try std.fmt.bufPrint(&pid_buf, "{d}", .{std.os.linux.getpid()});
+    try tmp.dir.writeFile(io, .{ .sub_path = "magnet.pid", .data = mine });
+    try testing.expect(mountRunning(io, cache));
+
+    // A daemon that exited leaves its pid file behind, so the number is what
+    // gets checked, not the file.
+    try tmp.dir.writeFile(io, .{ .sub_path = "magnet.pid", .data = "999999999" });
+    try testing.expect(!mountRunning(io, cache));
 }
 
 test "procs: a program is found on PATH or not at all" {
