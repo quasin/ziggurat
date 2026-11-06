@@ -301,6 +301,61 @@ pub const qbittorrent_asset: ?[]const u8 = switch (builtin.cpu.arch) {
 /// The port the WebUI of ziggurat's qBittorrent answers on.
 pub const qbittorrent_webui_port: u16 = 8090;
 
+/// The engine, fetched from its own release when the machine has none. A fresh
+/// session otherwise refuses every mount with "rekarma не найден", and there is
+/// no package manager that carries it — the binary beside the matching triple
+/// is the whole install. The tag is spelled out because the asset URL is built
+/// at compile time; it is the version this source was released with.
+pub const rekarma_release = "https://github.com/quasin/rekarma/releases/download/v0.1.0/";
+pub const rekarma_asset: ?[]const u8 = switch (builtin.cpu.arch) {
+    .x86_64 => "rekarma-x86_64-linux-gnu",
+    .aarch64 => "rekarma-aarch64-linux-gnu",
+    .riscv64 => "rekarma-riscv64-linux-gnu",
+    // Any other target still compiles; it just has no asset to fetch and falls
+    // back to the existing "not found" warning.
+    else => null,
+};
+
+/// Where the install lands, and where a later start looks for it even when
+/// `~/.local/bin` is not on PATH.
+pub fn defaultRekarmaPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ home, ".local/bin/rekarma" });
+}
+
+/// `.new` plus `mv` so a running engine is replaced by rename, never rewritten
+/// under a mount that is reading it. `--max-time` keeps a black-holed network
+/// from stalling the start for ever.
+pub fn rekarmaCommand(buf: []u8, home: []const u8, asset: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "mkdir -p \"{s}/.local/bin\" && curl -fsSL --max-time 120 {s}{s} -o \"{s}/.local/bin/rekarma.new\" && " ++
+            "chmod +x \"{s}/.local/bin/rekarma.new\" && " ++
+            "mv -f \"{s}/.local/bin/rekarma.new\" \"{s}/.local/bin/rekarma\"",
+        .{ home, rekarma_release, asset, home, home, home, home },
+    );
+}
+
+/// Fetches rekarma into `~/.local/bin` and waits: the first mount needs it, so
+/// unlike the optional installers this one cannot be backgrounded. Its output
+/// goes to `log_path` instead of the terminal the interface is about to take
+/// over; a failure leaves the usual "not found" status line in place.
+pub fn installRekarma(io: Io, home: []const u8, log_path: []const u8) !void {
+    const asset = rekarma_asset orelse return error.UnsupportedArch;
+    var cmd_buf: [2048]u8 = undefined;
+    const command = try rekarmaCommand(&cmd_buf, home, asset);
+
+    var wrapped_buf: [4096]u8 = undefined;
+    const wrapped = try std.fmt.bufPrint(&wrapped_buf, "( {s} ) >> \"{s}\" 2>&1", .{ command, log_path });
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", wrapped },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const term = try child.wait(io);
+    if (term != .exited or term.exited != 0) return error.RekarmaInstallFailed;
+}
+
 /// The RuTracker database source. The address is fixed, the archive has the
 /// upstream name, and `xz -d` turns it into the `.xml` beside it.
 pub const rutracker_address = "a74d01ff38a9a737cc009f54ae4bf4f0b03c446aa61e1c1d11fff5c6f6df06fc";
@@ -883,6 +938,23 @@ test "procs: the installer command carries the upstream script" {
     const cmd = try antClientCommand(&buf);
     try testing.expect(std.mem.indexOf(u8, cmd, "https://raw.githubusercontent.com/WithAutonomi/ant-client/main/install.sh") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "| bash") != null);
+}
+
+test "procs: the rekarma install names the release asset and the home" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+
+    const path = try defaultRekarmaPath(arena.allocator(), "/home/u");
+    try testing.expectEqualStrings("/home/u/.local/bin/rekarma", path);
+
+    var buf: [1024]u8 = undefined;
+    const cmd = try rekarmaCommand(&buf, "/home/u", "rekarma-x86_64-linux-gnu");
+    try testing.expect(std.mem.indexOf(u8, cmd, rekarma_release) != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "rekarma-x86_64-linux-gnu") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "\"/home/u/.local/bin/rekarma\"") != null);
+    // Replaced by rename, never rewritten: a mount may be reading the old one.
+    try testing.expect(std.mem.indexOf(u8, cmd, "mv -f") != null);
 }
 
 test "procs: the rutracker command downloads, unpacks and drops the archive" {

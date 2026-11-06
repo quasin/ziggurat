@@ -194,6 +194,43 @@ fn printVersion(out: *Io.Writer, versions: procs.ToolVersions) !void {
     });
 }
 
+/// One look for the mount engine where it is expected to be, then the install.
+/// A missing rekarma stops every mount, so a first start fetches it into
+/// `~/.local/bin` rather than leaving the interface unable to do its one job.
+fn ensureRekarma(
+    allocator: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    config: procs.Config,
+    path_var: ?[]const u8,
+    home: []const u8,
+) !?[]const u8 {
+    if (try procs.resolveExecutable(allocator, io, config.rekarma, path_var)) |exe| return exe;
+
+    // Only the default name is ziggurat's business: `--rekarma <path>` names a
+    // binary the user picked, and installing beside it would answer a question
+    // that was not asked.
+    if (!std.mem.eql(u8, config.rekarma, "rekarma") or home.len == 0) return null;
+
+    // `~/.local/bin` is often not on PATH in a fresh session; the file is still
+    // the one ziggurat installed, so use it as it is.
+    const installed = try procs.defaultRekarmaPath(allocator, home);
+    if (std.Io.Dir.cwd().access(io, installed, .{ .execute = true })) |_| return installed else |_| {}
+
+    // A target with no published asset keeps the plain "not found" warning.
+    if (procs.rekarma_asset == null) return null;
+
+    try out.writeAll("rekarma не найден — ставлю его в ~/.local/bin\n");
+    try out.flush();
+    std.Io.Dir.cwd().createDirPath(io, ".ziggurat") catch {};
+    procs.installRekarma(io, home, ".ziggurat/rekarma-install.log") catch {
+        // The status line already says what is missing and how to point at it.
+        return null;
+    };
+    if (std.Io.Dir.cwd().access(io, installed, .{ .execute = true })) |_| return installed else |_| {}
+    return null;
+}
+
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
         // A closed stdout is the reader going away (`ziggurat | head`), not an
@@ -245,8 +282,9 @@ fn run(init: std.process.Init) !void {
 
             // Resolved once, here, where the environment is in reach: a
             // missing rekarma is a warning on the status line rather than a
-            // spawn failure after the user has already pasted a magnet.
-            const rekarma_exe = try procs.resolveExecutable(arena, init.io, options.config.rekarma, path_var);
+            // spawn failure after the user has already pasted a magnet, and a
+            // machine that has none at all gets one installed first.
+            const rekarma_exe = try ensureRekarma(arena, init.io, out, options.config, path_var, home);
             const opener_exe = try procs.resolveExecutable(arena, init.io, options.config.opener, path_var);
             const ant_exe = try procs.resolveExecutable(arena, init.io, "ant", path_var);
             const xz_exe = try procs.resolveExecutable(arena, init.io, "xz", path_var);

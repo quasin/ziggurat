@@ -159,9 +159,14 @@ Running the interface needs `rekarma` (itself built with libfuse3) and
   a tty with the syscall-based `tcgetattr` above, and size the window with
   `linux.ioctl(fd, 0x5413, @intFromPtr(&ws))` into a `std.posix.winsize`.
 - **`rekarma` is not on PATH by default.** It is a separate project
-  (`zig-out/bin/rekarma`), so a fresh session shows "rekarma не найден" until it
-  is installed or passed as `--rekarma <path>`; the mount then runs from whatever
-  directory ziggurat was started in, creating `mnt/` and `.ziggurat/` there.
+  (`zig-out/bin/rekarma`), so a fresh session would show "rekarma не найден"
+  until it is installed or passed as `--rekarma <path>`; at startup ziggurat
+  therefore installs the `rekarma-<triple>` asset of its own release into
+  `~/.local/bin` when the name resolves nowhere, and uses that path for the run
+  (`rekarma_release`/`rekarma_asset` in `procs.zig` — bump the tag with the
+  release). It never touches an explicit `--rekarma` path, and a target with no
+  published asset keeps the warning. The mount then runs from whatever directory
+  ziggurat was started in, creating `mnt/` and `.ziggurat/` there.
 - **A mount appears later than the daemon that started it.** `rekarma --daemon`
   forks, prints its pid and exits, so the spawn says nothing about the mount:
   the row counts as mounted only when a readdir of `<mount-root>/<hash>` returns

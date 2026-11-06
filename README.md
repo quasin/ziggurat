@@ -36,7 +36,10 @@ Watching a release needs two more programs on `PATH` (both overridable):
 - `rekarma` — mounts a magnet or a `.torrent` as a read-only directory. Ziggurat
   starts it as a daemon per release:
   `rekarma --magnet <link>|--torrent <file> -m <dir> --cache <dir> --daemon`.
-  That binary needs libfuse3 at build and run time.
+  That binary needs libfuse3 at build and run time. A machine that has none
+  gets it installed on the first start: ziggurat fetches
+  `rekarma-<triple>` from its own GitHub release into `~/.local/bin/rekarma`
+  (only for the default name — an explicit `--rekarma <path>` is left alone).
 - `xdg-open` — hands a file of the mount to the desktop's default application,
   started as `xdg-open <path-inside-the-mount>`. Ziggurat names no player of its
   own: a film opens in whatever plays video, a book in whatever reads it.
