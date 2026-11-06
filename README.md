@@ -77,6 +77,15 @@ file, so it can be browsed with no peer at all. Quote a link in a shell: `?` and
 
 `--mount-root`, `--torrents`, `--cache`, `--history`, `--rekarma` and `--open`
 move all of it.
+
+Three more go straight to every rekarma daemon, because a release's cache is the
+one thing that must follow the machine it runs on: `--cache-limit <size>` caps
+what one release keeps on disk (`5G`, `512M`, `0` = nothing is dropped; default
+is 60 % of the free space on the cache's filesystem, and past it the coldest
+pieces are dropped and fetched again when they are read again), `--prefetch
+<size>` sets the read-ahead per waiting read (128 MiB by default, kinder to a
+slow uplink at `16M`), and `--fuse-threads <n>` sets the FUSE workers per mount
+(32 by default; a one-core box wants 8).
 A mount that never produces metadata is reported as `ошибка` after three
 minutes, with the last line of the daemon's log as the reason.
 

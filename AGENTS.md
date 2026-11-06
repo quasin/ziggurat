@@ -11,7 +11,11 @@ program's reads are what pull the pieces on demand. Published targets: x86_64, a
 Ziggurat itself does not download anything and does not link librats. The
 torrent, the mount and the piece scheduling live behind `--rekarma <binary>`,
 started once per release as
-`rekarma --magnet <link>|--torrent <file> -m <dir> --cache <dir> --daemon`.
+`rekarma --magnet <link>|--torrent <file> -m <dir> --cache <dir> --daemon`, plus
+`--cache-limit` / `--prefetch` / `--fuse-threads` when the user set them
+(procs.Config carries them as strings and `main.parse` validates them: a
+daemon's stderr is /dev/null, so a value rekarma rejects would look like a
+release that never mounts).
 `--help`/`--version` print rekarma's and librats' versions by running
 `rekarma --version` at startup, so the answer describes the engine the mounts
 will actually run.
@@ -182,6 +186,19 @@ Running the interface needs `rekarma` (itself built with libfuse3) and
   listing opens by itself when the row that finished mounting is the selected
   one, and `reportMountMedia` still states "файлов: N, папок: M" so the status
   is never a bare "смонтирован".
+- **One release's cache is bounded, and the limit looks at the disk, not at the
+  engine's bookkeeping.** rekarma keeps `--cache-limit` (default: 60 % of the
+  free space on the cache's filesystem) by forgetting the coldest piece and
+  punching its blocks out of the cache file — and by reclaiming the blocks of
+  pieces that were abandoned half-downloaded when a read window closed, which is
+  the residue that otherwise sits there for ever after a seek. Two consequences
+  for this side: the flags must ride along on the spawn (`procs.mount`), and a
+  value rekarma would reject has to be refused in `main.parse` instead, because
+  the daemon's stderr is `/dev/null` and the only symptom would be a release
+  that never mounts. Steady-state footprint is the limit plus what is in flight
+  (up to one read window per waiting reader), so a 5 GB limit on a 10 GB disk
+  leaves room for the OS; `REKARMA_EVICT_DEBUG=1` on the daemon prints what the
+  pass drops.
 - **A daemon per release needs its own cache dir**, `<cache>/<hash>`: rekarma
   writes `magnet.pid`/`magnet.log` into `--cache`, so two releases sharing one
   directory would overwrite each other's pid and stop the wrong mount. The same

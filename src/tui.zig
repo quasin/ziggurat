@@ -685,7 +685,7 @@ pub const App = struct {
         // the mountpoint instead of a second daemon overwriting the pid.
         if (self.adoptRunningMount(0, dirs.cache)) return;
 
-        procs.mount(self.io, exe, link, dirs.mount, dirs.cache) catch |err| {
+        procs.mount(self.io, exe, link, dirs.mount, dirs.cache, self.config) catch |err| {
             var buf: [200]u8 = undefined;
             const note = std.fmt.bufPrint(&buf, "rekarma: {s}", .{@errorName(err)}) catch "";
             self.runtime.items[0].state = .failed;
@@ -1127,7 +1127,7 @@ pub const App = struct {
                     self.setStatus("rekarma не найден в PATH — укажите --rekarma <путь>", .err);
                     return;
                 };
-                procs.mount(self.io, exe, entry.magnet, dirs.mount, dirs.cache) catch |err| {
+                procs.mount(self.io, exe, entry.magnet, dirs.mount, dirs.cache, self.config) catch |err| {
                     var buf: [200]u8 = undefined;
                     const note = std.fmt.bufPrint(&buf, "rekarma: {s}", .{@errorName(err)}) catch "";
                     rt.state = .failed;

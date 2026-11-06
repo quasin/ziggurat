@@ -23,6 +23,18 @@ pub const Config = struct {
     /// of its own, never the mount root: the mounted releases are the reader's,
     /// and a download landing in them would fight the FUSE server.
     torrents: []const u8 = "Torrents",
+    /// `--cache-limit <size>` for rekarma: how many bytes one release's cache
+    /// may keep on disk (holes are punched for the rest, which is what lets a
+    /// 10 GB machine mount a 2 TB release). Empty = rekarma's own default, 60 %
+    /// of the free space on the cache's filesystem.
+    cache_limit: []const u8 = "",
+    /// `--prefetch <size>`: read-ahead per waiting read. Empty = rekarma's
+    /// default (128 MiB), which a desktop wants and a slow uplink does not.
+    prefetch: []const u8 = "",
+    /// `--fuse-threads <n>`: FUSE workers. 0 = rekarma's default (32); a
+    /// one-core VPS wants fewer, because each worker is a thread that exists
+    /// only to wait for pieces.
+    fuse_threads: u32 = 0,
 };
 
 /// Where a program name actually lives, or null when it is nowhere.
@@ -77,17 +89,44 @@ pub fn mount(
     source: []const u8,
     mount_dir: []const u8,
     cache_dir: []const u8,
+    tuning: Config,
 ) !void {
     // The metadata comes from the swarm (--magnet) or from the file the user
     // picked (--torrent); everything else about the daemon is the same.
     const flag: []const u8 = if (magnet.isTorrent(source)) "--torrent" else "--magnet";
     const value: []const u8 = if (magnet.isTorrent(source)) magnet.torrentPath(source) else source;
+
+    // Built rather than spelled out because the tuning flags are optional. A
+    // daemon's stderr goes to /dev/null here, so a flag rekarma rejects would
+    // look like a mount that never appears: the values are validated in
+    // main.parse before they ever reach this point.
+    var args: [20][]const u8 = undefined;
+    var argc: usize = 0;
+    const fixed = [_][]const u8{ exe, flag, value, "-m", mount_dir, "--cache", cache_dir, "--daemon" };
+    for (fixed) |arg| {
+        args[argc] = arg;
+        argc += 1;
+    }
+    if (tuning.cache_limit.len > 0) {
+        args[argc] = "--cache-limit";
+        args[argc + 1] = tuning.cache_limit;
+        argc += 2;
+    }
+    if (tuning.prefetch.len > 0) {
+        args[argc] = "--prefetch";
+        args[argc + 1] = tuning.prefetch;
+        argc += 2;
+    }
+    var threads_buf: [8]u8 = undefined;
+    if (tuning.fuse_threads > 0) {
+        args[argc] = "--fuse-threads";
+        args[argc + 1] = std.fmt.bufPrint(&threads_buf, "{d}", .{tuning.fuse_threads}) catch
+            return error.MountStartFailed;
+        argc += 2;
+    }
+
     var child = try std.process.spawn(io, .{
-        .argv = &.{
-            exe,       flag,       value,
-            "-m",      mount_dir,  "--cache",
-            cache_dir, "--daemon",
-        },
+        .argv = args[0..argc],
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,

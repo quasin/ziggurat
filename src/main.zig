@@ -65,6 +65,12 @@ pub const usage =
     \\  --mount-root <dir>  where releases are mounted           [mnt]
     \\  --torrents <dir>    where complete releases are kept     [Torrents]
     \\  --cache <dir>       where pieces and logs are kept       [.ziggurat/cache]
+    \\  --cache-limit <n>   bytes one release's cache may keep: 5G, 512M, …
+    \\                      0 = everything read stays   [60% of free space]
+    \\                      past the limit the coldest pieces are dropped
+    \\                      and downloaded again when they are read again
+    \\  --prefetch <n>      read-ahead per waiting read           [128M]
+    \\  --fuse-threads <n>  FUSE workers per mount                  [32]
     \\  --history <path>    history file                         [.ziggurat/history.tsv]
     \\
     \\The magnet line accepts a full link, an xt= or urn: fragment, a bare
@@ -82,7 +88,7 @@ pub const usage =
     \\
 ;
 
-const Field = enum { rekarma, opener, mount_root, torrents, cache, history };
+const Field = enum { rekarma, opener, mount_root, torrents, cache, history, cache_limit, prefetch, fuse_threads };
 const Flag = struct { name: []const u8, field: Field };
 
 const flags = [_]Flag{
@@ -92,7 +98,32 @@ const flags = [_]Flag{
     .{ .name = "--torrents", .field = .torrents },
     .{ .name = "--cache", .field = .cache },
     .{ .name = "--history", .field = .history },
+    // Handed to every rekarma daemon: what a release's cache may keep, how far
+    // ahead it reads and how many FUSE workers it runs. The defaults are the
+    // engine's own, and they are a desktop's; a 1 GB VPS is the case these exist
+    // for.
+    .{ .name = "--cache-limit", .field = .cache_limit },
+    .{ .name = "--prefetch", .field = .prefetch },
+    .{ .name = "--fuse-threads", .field = .fuse_threads },
 };
+
+/// A size rekarma will accept: digits with an optional K/M/G/T suffix. Checked
+/// here because a mount daemon's stderr goes to /dev/null — a typo would show up
+/// only as a release that never appears.
+fn isSize(text: []const u8) bool {
+    if (text.len == 0) return false;
+    var end = text.len;
+    switch (text[text.len - 1]) {
+        'K', 'k', 'M', 'm', 'G', 'g', 'T', 't' => end -= 1,
+        else => {},
+    }
+    if (end == 0) return false;
+    for (text[0..end]) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
+    }
+    _ = std.fmt.parseInt(u64, text[0..end], 10) catch return false;
+    return true;
+}
 
 pub fn parse(args: []const []const u8) Command {
     // args[0] is the program name; skip it.
@@ -119,6 +150,20 @@ pub fn parse(args: []const []const u8) Command {
                         .torrents => options.config.torrents = value,
                         .cache => options.config.cache = value,
                         .history => options.history_path = value,
+                        .cache_limit => {
+                            if (!isSize(value)) return .{ .problem = arg };
+                            options.config.cache_limit = value;
+                        },
+                        .prefetch => {
+                            if (!isSize(value)) return .{ .problem = arg };
+                            options.config.prefetch = value;
+                        },
+                        .fuse_threads => {
+                            const threads = std.fmt.parseInt(u32, value, 10) catch
+                                return .{ .problem = arg };
+                            if (threads == 0 or threads > 128) return .{ .problem = arg };
+                            options.config.fuse_threads = threads;
+                        },
                     }
                     break;
                 },
@@ -343,6 +388,21 @@ test "parse: options take a separate value or an =value" {
     try std.testing.expectEqualStrings("h.tsv", b.run.history_path);
     try std.testing.expectEqualStrings("rel", b.run.config.mount_root);
     try std.testing.expectEqualStrings("/usr/bin/xdg-open", b.run.config.opener);
+}
+
+test "parse: the tuning flags reach rekarma, and a bad one is refused" {
+    const cmd = parse(&.{ "ziggurat", "--cache-limit", "5G", "--prefetch", "16M", "--fuse-threads", "8" });
+    try std.testing.expect(cmd == .run);
+    try std.testing.expectEqualStrings("5G", cmd.run.config.cache_limit);
+    try std.testing.expectEqualStrings("16M", cmd.run.config.prefetch);
+    try std.testing.expectEqual(@as(u32, 8), cmd.run.config.fuse_threads);
+
+    // A daemon's stderr is /dev/null, so a typo would only ever show up as a
+    // release that never appears: it has to fail here instead.
+    try std.testing.expect(parse(&.{ "ziggurat", "--cache-limit", "5 Z" }) == .problem);
+    try std.testing.expect(parse(&.{ "ziggurat", "--prefetch", "soon" }) == .problem);
+    try std.testing.expect(parse(&.{ "ziggurat", "--fuse-threads", "0" }) == .problem);
+    try std.testing.expect(parse(&.{ "ziggurat", "--fuse-threads", "many" }) == .problem);
 }
 
 test "parse: what does not parse names the argument" {
