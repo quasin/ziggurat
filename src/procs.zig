@@ -345,7 +345,7 @@ pub const qbittorrent_webui_port: u16 = 8090;
 /// no package manager that carries it — the binary beside the matching triple
 /// is the whole install. The tag is spelled out because the asset URL is built
 /// at compile time; it is the version this source was released with.
-pub const rekarma_release = "https://github.com/quasin/rekarma/releases/download/v0.1.0/";
+pub const rekarma_release = "https://github.com/quasin/rekarma/releases/download/v0.1.1/";
 pub const rekarma_asset: ?[]const u8 = switch (builtin.cpu.arch) {
     .x86_64 => "rekarma-x86_64-linux-gnu",
     .aarch64 => "rekarma-aarch64-linux-gnu",
