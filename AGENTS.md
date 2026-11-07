@@ -202,6 +202,19 @@ Running the interface needs `rekarma` (itself built with libfuse3) and
   (up to one read window per waiting reader), so a 5 GB limit on a 10 GB disk
   leaves room for the OS; `REKARMA_EVICT_DEBUG=1` on the daemon prints what the
   pass drops.
+- **The four knobs are also links under the source line, and Enter applies a
+  preset to the *next* mount.** `Кэш на релиз`, `Чтение вперёд`,
+  `Очередь на пира` and `FUSE-потоки` sit at the end of `links` (each with
+  `setting: Setting`), ←→ walks min/normal/max, and the right panel becomes
+  `drawSettingsPanel` — the three values with what each costs, then the wrapped
+  "why". The panel starts its arrows at the values the command line set
+  (`App.init` matches them against the table), so `--pipeline 32` shows `min`
+  instead of a hard-coded `normal`. Nothing is restarted: a running daemon was
+  spawned with its own copy of these flags, and the status line says so. Adding a
+  knob means an enum member, a `settings` entry in the same order, and a case in
+  `applyPreset`/`configValue` — the test in `tui.zig` checks the table is neither
+  short nor has duplicate presets, because two equal values would make ←→ look
+  broken.
 - **A daemon per release needs its own cache dir**, `<cache>/<hash>`: rekarma
   writes `magnet.pid`/`magnet.log` into `--cache`, so two releases sharing one
   directory would overwrite each other's pid and stop the wrong mount. The same

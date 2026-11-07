@@ -73,18 +73,144 @@ const View = enum { history, files, room, database };
 /// The shortcuts under the source line: fixed one-shot jobs, each with its own
 /// log, not history entries. `↓` walks them, Enter runs the selected one. The
 /// room shortcut is the one that stays: it opens the default room's history in
-/// the left panel instead of running a job and returning.
+/// the left panel instead of running a job and returning. The last four entries
+/// are the mount's tuning knobs: ←→ picks min/normal/max, Enter writes the value
+/// into the flags the next mount is spawned with, and the right panel explains
+/// what the choice costs.
 const Link = struct {
     label: []const u8,
-    action: Action,
+    action: ?Action = null,
+    setting: ?Setting = null,
 };
 const Action = enum { autonomi_install, qbittorrent_install, rutracker_database, rutracker_view, room_history };
+
+/// A mount knob the interface can retune without a command line. The presets are
+/// what a 5 GB VPS, an ordinary desktop and a fast line want; the flags stay the
+/// way to say something else. A change reaches the *next* mount: a release that
+/// is already mounted keeps the flags its daemon was started with, because those
+/// live in that process.
+const Setting = enum { cache_limit, prefetch, pipeline, fuse_threads };
+const Preset = enum { min, normal, max };
+
+const SettingInfo = struct {
+    label: []const u8,
+    /// The flag's value per preset; "" is the engine's own default.
+    values: [3][]const u8,
+    /// What that preset is for, printed against it in the right panel.
+    notes: [3][]const u8,
+    /// Why the knob exists, wrapped under the presets.
+    why: []const u8,
+};
+
+/// One entry per `Setting`, in enum order. The numbers are the ones measured on
+/// this engine: 16 blocks per peer is librats' own ceiling at 256 KiB / RTT,
+/// 500 is qBittorrent's reqq, and the read-ahead window is clamped to a
+/// sixteenth of the cache limit — which is why the cache's `min` stops at 2 GB
+/// (below that the window drops under 128 MiB and playback reads at the frontier).
+const settings = [_]SettingInfo{
+    .{
+        .label = "Кэш на релиз",
+        .values = .{ "2G", "", "0" },
+        .notes = .{
+            "2 ГБ — VPS с маленьким диском",
+            "авто — 60 % свободного места",
+            "0 — без лимита, диск под нож",
+        },
+        .why = "Сколько байт одного релиза остаётся на диске. Сверх лимита " ++
+            "вытесняются самые холодные куски: файл релиза сохраняет размер, а " ++
+            "дырки забиваются заново, когда их снова прочтут. Меньше 2 ГБ окно " ++
+            "чтения сжимается до 1/16 лимита и плеер читает с фронта загрузки — " ++
+            "это те самые паузы. Держите лимит в 50–70 % свободного места.",
+    },
+    .{
+        .label = "Чтение вперёд",
+        .values = .{ "16M", "128M", "512M" },
+        .notes = .{
+            "16M — экономно, перемотка ждёт",
+            "128M — как у rekarma сейчас",
+            "512M — быстрая линия, длинные склейки",
+        },
+        .why = "Сколько байт читать вперёд от позиции плеера. Это же объём, " ++
+            "который качается до того, как вы туда дойдёте: на 5 ГБ диска 128 МиБ " ++
+            "уже сороковая часть кэша, и больший объём окупается только на быстрой " ++
+            "раздаче с быстрыми сидами.",
+    },
+    .{
+        .label = "Очередь на пира",
+        .values = .{ "32", "500", "1000" },
+        .notes = .{
+            "32 — меньше памяти, ниже потолок",
+            "500 — как у qBittorrent",
+            "1000 — быстрая линия, мало сидов",
+        },
+        .why = "Сколько 16-КиБ блоков держать в полёте на каждого пира. librats " ++
+            "сам просит 16, а это потолок 256 КиБ / RTT: пир в 150 мс не отдаст " ++
+            "больше ~1,7 МБ/с, сколько бы он ни мог. Очередь глубже — но её " ++
+            "глубина на пира всё равно подстраивается под его скорость, иначе " ++
+            "медленный сид держит кусок, на котором стоит плеер.",
+    },
+    .{
+        .label = "FUSE-потоки",
+        .values = .{ "8", "32", "64" },
+        .notes = .{
+            "8 — один читатель, одно ядро",
+            "32 — как у rekarma сейчас",
+            "64 — много одновременных читателей",
+        },
+        .why = "Сколько запросов к монтированию обслуживается разом. Каждый " ++
+            "поток — ожидание кусков; на одном ядре 32 ожидающих потока дерутся " ++
+            "за него, а на восьми ядрах широкий пул помогает, когда плеер читает " ++
+            "хвост файла (индекс mkv) и обычную последовательность одновременно.",
+    },
+};
+
+fn presetValue(setting: Setting, preset: Preset) []const u8 {
+    return settings[@backingInt(setting)].values[@backingInt(preset)];
+}
+
+/// Which preset a flag value equals, or null when it is something the command
+/// line said and no preset names.
+fn matchPreset(setting: Setting, value: []const u8) ?Preset {
+    for (settings[@backingInt(setting)].values, 0..) |candidate, i| {
+        if (std.mem.eql(u8, candidate, value)) return @fromBackingInt(@intCast(i));
+    }
+    return null;
+}
+
+/// A preset value is what the flag behind it accepts: digits with an optional
+/// K/M/G/T suffix (rekarma's size parser) or bare digits (block and thread counts).
+fn isPresetValue(value: []const u8) bool {
+    var end = value.len;
+    switch (value[value.len - 1]) {
+        'K', 'k', 'M', 'm', 'G', 'g', 'T', 't' => end -= 1,
+        else => {},
+    }
+    if (end == 0) return false;
+    for (value[0..end]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+/// The flag value of one setting, as the panel compares it. `fuse_threads` is a
+/// number in Config, so it is rendered into the caller's buffer.
+fn configValue(buf: []u8, config: procs.Config, setting: Setting) []const u8 {
+    return switch (setting) {
+        .cache_limit => config.cache_limit,
+        .prefetch => config.prefetch,
+        .pipeline => config.pipeline,
+        .fuse_threads => std.fmt.bufPrint(buf, "{d}", .{config.fuse_threads}) catch "",
+    };
+}
+
 const links = [_]Link{
     .{ .label = "Autonomi Install", .action = .autonomi_install },
     .{ .label = "Install qBittorrent-nox", .action = .qbittorrent_install },
     .{ .label = "Install RuTracker.Org DataBase", .action = .rutracker_database },
     .{ .label = "База RuTracker.Org", .action = .rutracker_view },
     .{ .label = "История reKarma", .action = .room_history },
+    .{ .label = "Кэш на релиз", .setting = .cache_limit },
+    .{ .label = "Чтение вперёд", .setting = .prefetch },
+    .{ .label = "Очередь на пира", .setting = .pipeline },
+    .{ .label = "FUSE-потоки", .setting = .fuse_threads },
 };
 
 /// How many of the room's newest messages are kept in memory. The recorder caps
@@ -143,6 +269,10 @@ pub const App = struct {
     /// line, and which one. Enter runs it, `↓`/`↑` move through the list.
     link_selected: bool = false,
     link_index: usize = 0,
+    /// The preset the arrow keys sit on, per setting — which is not necessarily
+    /// what the flag currently is: `config` may have come from the command line.
+    /// ←→ moves it, Enter writes it into `config`.
+    preset: [settings.len]Preset = .{ .normal, .normal, .normal, .normal },
     view: View = .history,
     selected: usize = 0,
 
@@ -240,6 +370,15 @@ pub const App = struct {
             .db_query = .empty,
         };
         try app.list.load(io, options.history_path);
+        // The arrows start where the command line already is: a panel that says
+        // "normal" over a flag set with --pipeline 32 would be lying.
+        {
+            var value_buf: [12]u8 = undefined;
+            for (0..settings.len) |i| {
+                const setting: Setting = @fromBackingInt(@intCast(i));
+                app.preset[i] = matchPreset(setting, configValue(&value_buf, config, setting)) orelse .normal;
+            }
+        }
         for (app.list.items.items) |entry| {
             // What a previous session left mounted is a fact of the filesystem,
             // not of the history file: ask the mountpoint. A release whose
@@ -547,6 +686,12 @@ pub const App = struct {
                     self.cursor = 0;
                     return;
                 },
+                .left, .right => {
+                    if (links[self.link_index].setting) |setting| {
+                        self.stepPreset(setting, if (key == .left) -1 else 1);
+                    }
+                    return;
+                },
                 .enter => return self.runLink(),
                 .tab => {
                     self.link_selected = false;
@@ -722,13 +867,59 @@ pub const App = struct {
     }
 
     fn runLink(self: *App) !void {
-        switch (links[self.link_index].action) {
+        const link = links[self.link_index];
+        // A tuning link writes a flag instead of running a job: the same Enter
+        // that installs qBittorrent applies the preset the arrows picked.
+        if (link.setting) |setting| {
+            self.applyPreset(setting);
+            return;
+        }
+        switch (link.action orelse return) {
             .autonomi_install => try self.installAutonomi(),
             .qbittorrent_install => try self.installQbittorrent(),
             .rutracker_database => try self.downloadRutrackerDatabase(),
             .rutracker_view => try self.openDatabase(),
             .room_history => try self.openRoom(),
         }
+    }
+
+    /// ←→ on a tuning link: walk min → normal → max, wrapping.
+    fn stepPreset(self: *App, setting: Setting, delta: i8) void {
+        const slot = &self.preset[@backingInt(setting)];
+        const count: i8 = settings[@backingInt(setting)].values.len;
+        const next = @mod(@as(i8, @backingInt(slot.*)) + delta, count);
+        slot.* = @fromBackingInt(@intCast(next));
+    }
+
+    /// Enter on a tuning link: write the preset into the flags the next mount is
+    /// spawned with. Nothing is restarted — a daemon already running holds its own
+    /// copy of these values, and pretending otherwise would be a lie on screen.
+    fn applyPreset(self: *App, setting: Setting) void {
+        const value = presetValue(setting, self.preset[@backingInt(setting)]);
+        switch (setting) {
+            .cache_limit => self.config.cache_limit = value,
+            .prefetch => self.config.prefetch = value,
+            .pipeline => self.config.pipeline = value,
+            // `--fuse-threads` is a number in Config, not a string with a suffix:
+            // the presets are already plain decimal, so the parse cannot fail —
+            // the fallback is the engine's own default, not a refusal.
+            .fuse_threads => self.config.fuse_threads =
+                if (value.len == 0) 0 else std.fmt.parseInt(u32, value, 10) catch 32,
+        }
+
+        var buf: [200]u8 = undefined;
+        const shown = if (value.len == 0) "авто" else value;
+        const text = std.fmt.bufPrint(&buf, "{s}: {s} · следующее монтирование, текущее не меняется", .{
+            settings[@backingInt(setting)].label, shown,
+        }) catch "";
+        self.setStatus(text, .ok);
+    }
+
+    /// Which preset the flag currently equals, so the panel can mark it. A value
+    /// from the command line that matches no preset is reported as "своё".
+    fn currentPreset(self: *const App, setting: Setting) ?Preset {
+        var buf: [12]u8 = undefined;
+        return matchPreset(setting, configValue(&buf, self.config, setting));
     }
 
     /// Enter on the qBittorrent shortcut: the headless client lands in
@@ -1499,10 +1690,19 @@ pub const App = struct {
         // Interiors first, boxes last: a panel's content erases to the end of
         // its line, and drawing the borders afterwards keeps them intact.
         const cursor_at = self.drawInputPanel(&frame, top, 1, height, left_width);
+        // While a tuning link is selected the right panel stops being the history
+        // and becomes that knob's min/normal/max with what each one costs.
+        const tuning: ?Setting = if (self.view == .history and self.focus == .input and self.link_selected)
+            links[self.link_index].setting
+        else
+            null;
         var room_cursor: ?[2]u16 = null;
         var db_cursor: ?[2]u16 = null;
         switch (self.view) {
-            .history => self.drawHistoryPanel(&frame, top, right_left, height, right_width),
+            .history => if (tuning) |setting|
+                self.drawSettingsPanel(&frame, top, right_left, height, right_width, setting)
+            else
+                self.drawHistoryPanel(&frame, top, right_left, height, right_width),
             .files => self.drawFilesPanel(&frame, top, right_left, height, right_width),
             .room => room_cursor = self.drawRoomPanel(&frame, top, right_left, height, right_width),
             .database => db_cursor = self.drawDatabasePanel(&frame, top, right_left, height, right_width),
@@ -1513,7 +1713,7 @@ pub const App = struct {
         frame.endRow();
 
         drawBox(&frame, top, 1, height, left_width, "Ввод");
-        drawBox(&frame, top, right_left, height, right_width, switch (self.view) {
+        drawBox(&frame, top, right_left, height, right_width, if (tuning != null) "Настройки" else switch (self.view) {
             .history => "История",
             .files => "Содержимое релиза",
             .room => "Комната reKarma",
@@ -1605,7 +1805,9 @@ pub const App = struct {
         frame.endRow();
 
         // The shortcuts under the prompt: `↓` selects them, Enter runs the job
-        // instead of mounting the line. Labels are clipped to the panel.
+        // instead of mounting the line. Labels are clipped to the panel. A tuning
+        // link carries the preset the arrows are on, so the left panel always says
+        // what Enter would apply; the choices themselves are on the right.
         const link_focused = focused and self.link_selected;
         for (links, 0..) |link, i| {
             const link_row = top + 2 + @as(u16, @intCast(i));
@@ -1613,7 +1815,15 @@ pub const App = struct {
             const selected = link_focused and i == self.link_index;
             frame.at(link_row, left + 1);
             frame.put(if (selected) .selected else .dim, if (selected) "▸ " else "  ");
-            frame.put(if (selected) .selected else .accent, truncateTo(link.label, width -| 4));
+            if (link.setting) |setting| {
+                var label_buf: [96]u8 = undefined;
+                const shown = std.fmt.bufPrint(&label_buf, "{s} · {s}", .{
+                    link.label, @tagName(self.preset[@backingInt(setting)]),
+                }) catch link.label;
+                frame.put(if (selected) .selected else .accent, truncateTo(shown, width -| 4));
+            } else {
+                frame.put(if (selected) .selected else .accent, truncateTo(link.label, width -| 4));
+            }
             frame.endRow();
         }
 
@@ -1646,8 +1856,12 @@ pub const App = struct {
         }
 
         if (row + 2 < top + height - 1) {
+            const link_hint = link_focused and links[self.link_index].setting != null;
             frame.at(row + 1, left + 1);
-            frame.put(.dim, "Enter — выполнить · ↑↓ — ссылки");
+            frame.put(.dim, if (link_hint)
+                "←→ — min/normal/max · Enter — применить"
+            else
+                "Enter — выполнить · ↑↓ — ссылки");
             frame.at(row + 2, left + 1);
             frame.put(.dim, "Tab — к истории, Esc — очистить");
         }
@@ -1849,6 +2063,56 @@ pub const App = struct {
         return .{ query_row, @min(cursor_col, left + width - 2) };
     }
 
+    /// The right panel while a tuning link is selected: the three presets with
+    /// what each is for, then why the knob exists. It takes the history panel's
+    /// place rather than adding a third box — the screen stays two panels.
+    fn drawSettingsPanel(self: *App, frame: *term.Frame, top: u16, left: u16, height: u16, width: u16, setting: Setting) void {
+        const info = &settings[@backingInt(setting)];
+        const inner: u16 = width -| 2;
+        const text_left = left + 2;
+        const text_width = inner -| 2;
+        const stop = top + height - 1;
+        if (text_width < 8) return;
+
+        var head_buf: [160]u8 = undefined;
+        const current = if (self.currentPreset(setting)) |preset|
+            std.fmt.bufPrint(&head_buf, "{s} · сейчас {s}", .{ info.label, @tagName(preset) }) catch info.label
+        else
+            std.fmt.bufPrint(&head_buf, "{s} · сейчас своё значение", .{info.label}) catch info.label;
+        frame.at(top + 1, text_left);
+        frame.put(.accent, truncateTo(current, text_width));
+        frame.endRow();
+
+        // The three choices, one row each: the name the arrows pick, the value
+        // that would be written, and what it is for.
+        var row = top + 3;
+        for (info.values, 0..) |value, i| {
+            if (row >= stop) return;
+            const preset: Preset = @fromBackingInt(@intCast(i));
+            const chosen = self.preset[@backingInt(setting)] == preset;
+            const applied = self.currentPreset(setting) == preset;
+            var line: [200]u8 = undefined;
+            const shown = if (value.len == 0) "авто" else value;
+            const text = std.fmt.bufPrint(&line, "{s:<6} {s:<6} {s}", .{
+                @tagName(preset), shown, info.notes[i],
+            }) catch "";
+            frame.at(row, left + 1);
+            frame.put(if (chosen) .selected else .dim, if (chosen) "▸" else " ");
+            frame.put(if (chosen) .selected else if (applied) .ok else .plain, truncateTo(text, inner -| 2));
+            frame.endRow();
+            row += 1;
+        }
+
+        row += 1;
+        row = putWrapped(frame, row, text_left, text_width, .dim, info.why, stop);
+
+        if (row + 1 < stop) {
+            frame.at(stop - 1, text_left);
+            frame.put(.dim, "←→ — вариант · Enter — применить · Esc — назад");
+            frame.endRow();
+        }
+    }
+
     fn drawHistoryPanel(self: *App, frame: *term.Frame, top: u16, left: u16, height: u16, width: u16) void {
         const rows = height - 2;
         const inner_width = width - 2;
@@ -1992,6 +2256,41 @@ fn findDatabase(allocator: std.mem.Allocator, io: Io) !?[]u8 {
     return best;
 }
 
+/// Print @p text into the panel, breaking on spaces, and return the row after the
+/// last one used. No allocation and no measuring pass: the text is a compile-time
+/// string and the wrap walks it once.
+fn putWrapped(frame: *term.Frame, start_row: u16, col: u16, width: u16, style: term.Style, text: []const u8, stop_row: u16) u16 {
+    if (width == 0) return start_row;
+    var row = start_row;
+    var start: usize = 0;
+    while (start < text.len and row < stop_row) {
+        var i = start;
+        var fit_end = start;
+        var used: u16 = 0;
+        while (i < text.len) {
+            const stop = std.mem.indexOfScalarPos(u8, text, i, ' ') orelse text.len;
+            const word_width = term.displayWidth(text[i..stop]);
+            const add: u16 = if (used == 0) word_width else word_width + 1;
+            if (used != 0 and used + add > width) break;
+            used += add;
+            fit_end = stop;
+            i = if (stop < text.len) stop + 1 else text.len;
+        }
+        // A word longer than the panel is cut rather than left unsaid.
+        if (fit_end == start) fit_end = @min(text.len, start + width);
+
+        frame.at(row, col);
+        frame.put(style, std.mem.trimEnd(u8, text[start..fit_end], " "));
+        frame.endRow();
+        row += 1;
+
+        var next = fit_end;
+        while (next < text.len and text[next] == ' ') next += 1;
+        start = next;
+    }
+    return row;
+}
+
 fn sizeText(buf: []u8, bytes: u64) []const u8 {
     const units = [_][]const u8{ "Б", "КБ", "МБ", "ГБ", "ТБ" };
     var value: f64 = @floatFromInt(bytes);
@@ -2105,4 +2404,44 @@ test "tui: sizes are reported in the largest unit that fits" {
     try testing.expectEqualStrings("512 Б", sizeText(&buf, 512));
     try testing.expectEqualStrings("1.5 КБ", sizeText(&buf, 1536));
     try testing.expectEqualStrings("2.0 ГБ", sizeText(&buf, 2 * 1024 * 1024 * 1024));
+}
+
+test "tui: every tuning link has three distinct presets a flag accepts" {
+    // One entry per Setting, in enum order: the last member's index plus one is
+    // the count the table must have.
+    try testing.expectEqual(@as(usize, @backingInt(Setting.fuse_threads)), settings.len - 1);
+    for (settings) |info| {
+        try testing.expect(info.label.len > 0);
+        try testing.expect(info.why.len > 0);
+        // Distinct neighbours: two equal values would make ←→ do nothing.
+        try testing.expect(!std.mem.eql(u8, info.values[0], info.values[1]));
+        try testing.expect(!std.mem.eql(u8, info.values[1], info.values[2]));
+        for (info.values, 0..) |value, k| {
+            try testing.expect(info.notes[k].len > 0);
+            // A preset either restores the engine's default ("") or names a size.
+            if (value.len > 0) try testing.expect(isPresetValue(value));
+        }
+    }
+    // The links carry every setting exactly once.
+    for (0..settings.len) |i| {
+        const setting: Setting = @fromBackingInt(@intCast(i));
+        var found = false;
+        for (links) |link| {
+            if (link.setting) |s| found = found or s == setting;
+        }
+        try testing.expect(found);
+    }
+}
+
+test "tui: a preset names the flag value, and a custom value matches none" {
+    try testing.expectEqualStrings("2G", presetValue(.cache_limit, .min));
+    try testing.expectEqualStrings("", presetValue(.cache_limit, .normal));
+    try testing.expectEqualStrings("500", presetValue(.pipeline, .normal));
+    try testing.expectEqual(@as(u32, 8), try std.fmt.parseInt(u32, presetValue(.fuse_threads, .min), 10));
+    try testing.expectEqual(@as(u32, 64), try std.fmt.parseInt(u32, presetValue(.fuse_threads, .max), 10));
+
+    try testing.expectEqual(@as(?Preset, .normal), matchPreset(.cache_limit, ""));
+    try testing.expectEqual(@as(?Preset, .max), matchPreset(.cache_limit, "0"));
+    try testing.expectEqual(@as(?Preset, null), matchPreset(.cache_limit, "7G"));
+    try testing.expectEqual(@as(?Preset, null), matchPreset(.fuse_threads, "16"));
 }

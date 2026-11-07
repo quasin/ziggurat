@@ -52,11 +52,23 @@ answer therefore describes the engine the mounts will actually run.
 
     Enter    mount the source line / open the selected row / play a file
     ↓        select a shortcut under the source line
+    ← →      under a tuning shortcut: min / normal / max, Enter applies it
     Tab      move between the input line and the history
     u        unmount the selected release
     x        forget the selected row
     Esc      clear the input line, or leave the file list
     Ctrl-C   quit — mounts keep running until `u` or their pid is killed
+
+The shortcuts under the source line are jobs (Autonomi, qBittorrent, the
+RuTracker dump) and the mount's four tuning knobs. Walking onto a knob replaces
+the history with a panel that names its min/normal/max presets, the value each
+writes and what it is for: `Кэш на релиз` (`2G` / авто, 60 % of free space / no
+limit), `Чтение вперёд` (`16M` / `128M` / `512M`), `Очередь на пира`
+(`32` / `500` / `1000` blocks) and `FUSE-потоки` (`8` / `32` / `64`). Enter
+writes the spot into the flags of the *next* mount; a release already mounted
+keeps the flags its daemon was started with, since those live in that process.
+`--cache-limit`, `--prefetch`, `--pipeline` and `--fuse-threads` stay the way to
+name a value no preset covers.
 
 The source line accepts a full magnet link, an `xt=` or `urn:` fragment, a bare
 info-hash (40 hex or 32 base32) — every one of those is completed into
