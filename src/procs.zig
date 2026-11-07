@@ -31,6 +31,10 @@ pub const Config = struct {
     /// `--prefetch <size>`: read-ahead per waiting read. Empty = rekarma's
     /// default (128 MiB), which a desktop wants and a slow uplink does not.
     prefetch: []const u8 = "",
+    /// `--pipeline <blocks>`: block requests in flight per peer. Empty =
+    /// rekarma's default (500); 0 is librats' own 16, which caps one peer at
+    /// 256 KiB per round trip and starves a fast line with few seeders.
+    pipeline: []const u8 = "",
     /// `--fuse-threads <n>`: FUSE workers. 0 = rekarma's default (32); a
     /// one-core VPS wants fewer, because each worker is a thread that exists
     /// only to wait for pieces.
@@ -115,6 +119,11 @@ pub fn mount(
     if (tuning.prefetch.len > 0) {
         args[argc] = "--prefetch";
         args[argc + 1] = tuning.prefetch;
+        argc += 2;
+    }
+    if (tuning.pipeline.len > 0) {
+        args[argc] = "--pipeline";
+        args[argc + 1] = tuning.pipeline;
         argc += 2;
     }
     var threads_buf: [8]u8 = undefined;

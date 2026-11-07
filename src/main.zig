@@ -70,6 +70,9 @@ pub const usage =
     \\                      past the limit the coldest pieces are dropped
     \\                      and downloaded again when they are read again
     \\  --prefetch <n>      read-ahead per waiting read           [128M]
+    \\  --pipeline <n>      block requests in flight per peer    [500]
+    \\                      16K each; deeper fills a fast link from
+    \\                      few seeders, 0 = the engine's own 16
     \\  --fuse-threads <n>  FUSE workers per mount                  [32]
     \\  --history <path>    history file                         [.ziggurat/history.tsv]
     \\
@@ -88,7 +91,7 @@ pub const usage =
     \\
 ;
 
-const Field = enum { rekarma, opener, mount_root, torrents, cache, history, cache_limit, prefetch, fuse_threads };
+const Field = enum { rekarma, opener, mount_root, torrents, cache, history, cache_limit, prefetch, pipeline, fuse_threads };
 const Flag = struct { name: []const u8, field: Field };
 
 const flags = [_]Flag{
@@ -104,6 +107,7 @@ const flags = [_]Flag{
     // for.
     .{ .name = "--cache-limit", .field = .cache_limit },
     .{ .name = "--prefetch", .field = .prefetch },
+    .{ .name = "--pipeline", .field = .pipeline },
     .{ .name = "--fuse-threads", .field = .fuse_threads },
 };
 
@@ -157,6 +161,13 @@ pub fn parse(args: []const []const u8) Command {
                         .prefetch => {
                             if (!isSize(value)) return .{ .problem = arg };
                             options.config.prefetch = value;
+                        },
+                        .pipeline => {
+                            const blocks = std.fmt.parseInt(u32, value, 10) catch
+                                return .{ .problem = arg };
+                            // The ceiling rekarma accepts; 0 means its own default (16).
+                            if (blocks > 4096) return .{ .problem = arg };
+                            options.config.pipeline = value;
                         },
                         .fuse_threads => {
                             const threads = std.fmt.parseInt(u32, value, 10) catch
@@ -391,10 +402,11 @@ test "parse: options take a separate value or an =value" {
 }
 
 test "parse: the tuning flags reach rekarma, and a bad one is refused" {
-    const cmd = parse(&.{ "ziggurat", "--cache-limit", "5G", "--prefetch", "16M", "--fuse-threads", "8" });
+    const cmd = parse(&.{ "ziggurat", "--cache-limit", "5G", "--prefetch", "16M", "--pipeline", "300", "--fuse-threads", "8" });
     try std.testing.expect(cmd == .run);
     try std.testing.expectEqualStrings("5G", cmd.run.config.cache_limit);
     try std.testing.expectEqualStrings("16M", cmd.run.config.prefetch);
+    try std.testing.expectEqualStrings("300", cmd.run.config.pipeline);
     try std.testing.expectEqual(@as(u32, 8), cmd.run.config.fuse_threads);
 
     // A daemon's stderr is /dev/null, so a typo would only ever show up as a
@@ -403,6 +415,8 @@ test "parse: the tuning flags reach rekarma, and a bad one is refused" {
     try std.testing.expect(parse(&.{ "ziggurat", "--prefetch", "soon" }) == .problem);
     try std.testing.expect(parse(&.{ "ziggurat", "--fuse-threads", "0" }) == .problem);
     try std.testing.expect(parse(&.{ "ziggurat", "--fuse-threads", "many" }) == .problem);
+    try std.testing.expect(parse(&.{ "ziggurat", "--pipeline", "soon" }) == .problem);
+    try std.testing.expect(parse(&.{ "ziggurat", "--pipeline", "9999" }) == .problem);
 }
 
 test "parse: what does not parse names the argument" {

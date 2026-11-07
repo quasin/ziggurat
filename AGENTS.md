@@ -195,7 +195,10 @@ Running the interface needs `rekarma` (itself built with libfuse3) and
   for this side: the flags must ride along on the spawn (`procs.mount`), and a
   value rekarma would reject has to be refused in `main.parse` instead, because
   the daemon's stderr is `/dev/null` and the only symptom would be a release
-  that never mounts. Steady-state footprint is the limit plus what is in flight
+  that never mounts. The same rule covers `--pipeline <blocks>`: it is the
+  per-peer block queue (16 KiB blocks, default 500 there), it is what keeps a
+  fast link fed from a handful of seeders, and it is validated 0..4096 on both
+  sides so neither can hand the other a value it refuses. Steady-state footprint is the limit plus what is in flight
   (up to one read window per waiting reader), so a 5 GB limit on a 10 GB disk
   leaves room for the OS; `REKARMA_EVICT_DEBUG=1` on the daemon prints what the
   pass drops.
